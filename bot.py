@@ -1041,7 +1041,7 @@ def _build_pred_msg(pred: dict, prev_pred: dict, prev_game: dict, curr_game: dic
         outcome_block +
         f"\n\n<i>🔄 {now} | ⚡ Live</i>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🤖 <i>Sicbo Sunwin Bot • Ultra v5.0</i>"
+        "🤖 <i>Sicbo Sunwin Bot • </i>"
     )
 
 # ══════════════════════════════════════════════════════════════════
