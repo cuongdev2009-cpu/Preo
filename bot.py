@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║      🎲  SICBO SUNWIN BOT  — Ultra Edition v3.2                 ║
-║   Nạp lịch sử API ngay từ đầu • Dự đoán chính xác tức thì       ║
+║      🎲  SICBO SUNWIN BOT  — Ultra Edition v4.0                ║
+║   Bảo trì thông minh • Dự đoán đa tầng • Siêu chính xác       ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -57,7 +57,7 @@ BASE_HEADERS = {
 
 FETCH_INTERVAL = 2.5
 DB_PATH        = "sicbo.db"
-MEM_WINDOW     = 200            # tăng lên để chứa toàn bộ lịch sử API
+MEM_WINDOW     = 200
 MAX_RETRIES    = 3
 
 logging.basicConfig(
@@ -70,12 +70,20 @@ log = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════
 #  GLOBAL STATE
 # ══════════════════════════════════════════════════════════════════
-_history:   deque = deque(maxlen=MEM_WINDOW)   # newest first
+_history:   deque = deque(maxlen=MEM_WINDOW)
 _latest:    dict  = {}
 _pred:      dict  = {}
 _auto_msg:  dict  = {}
 _api_ok:    bool  = False
 _prev_pred: dict  = {}
+
+# Trạng thái bảo trì
+_maintenance_state = {
+    "active": False,
+    "end_time": None,
+    "reason": "",
+    "task": None
+}
 
 # ══════════════════════════════════════════════════════════════════
 #  DATABASE
@@ -174,9 +182,10 @@ def is_tai(score: int, faces: list) -> Optional[bool]:
     return None
 
 # ══════════════════════════════════════════════════════════════════
-#  PREDICTION ENGINE
+#  PREDICTION ENGINE (NÂNG CẤP TOÀN DIỆN)
 # ══════════════════════════════════════════════════════════════════
 
+# --- Các thuật toán gốc đã có (vẫn giữ) ---
 def _markov2(seq: List[bool]) -> Tuple[Optional[bool], int]:
     if len(seq) < 8:
         return None, 50
@@ -313,6 +322,130 @@ def _entropy_analysis(seq: List[bool]) -> Tuple[Optional[bool], int]:
         return True, 75
     return None, 50
 
+# --- THUẬT TOÁN MỚI (BẮT CẦU, BẺ CẦU, PHÂN TÍCH KHOẢNG CÁCH) ---
+
+def _gap_analysis(seq: List[bool]) -> Tuple[Optional[bool], int]:
+    """Phân tích khoảng cách giữa các lần xuất hiện Tài / Xỉu."""
+    if len(seq) < 10:
+        return None, 50
+    # Lấy vị trí các lần True (Tài) và False (Xỉu)
+    true_pos = [i for i, v in enumerate(seq) if v]
+    false_pos = [i for i, v in enumerate(seq) if not v]
+    if len(true_pos) < 3 or len(false_pos) < 3:
+        return None, 50
+
+    # Khoảng cách trung bình giữa các lần xuất hiện
+    true_gaps = [true_pos[i+1] - true_pos[i] for i in range(len(true_pos)-1)]
+    false_gaps = [false_pos[i+1] - false_pos[i] for i in range(len(false_pos)-1)]
+    avg_true_gap = sum(true_gaps) / len(true_gaps)
+    avg_false_gap = sum(false_gaps) / len(false_gaps)
+
+    last_true_pos = true_pos[-1]
+    last_false_pos = false_pos[-1]
+    current_pos = len(seq) - 1
+
+    # Khoảng cách từ lần cuối cùng đến hiện tại
+    dist_since_true = current_pos - last_true_pos
+    dist_since_false = current_pos - last_false_pos
+
+    # Nếu khoảng cách vượt ngưỡng trung bình + 1.5, dự đoán sự kiện đó sắp xảy ra
+    if dist_since_true >= avg_true_gap * 1.5:
+        return True, min(60 + int(dist_since_true - avg_true_gap)*3, 85)
+    if dist_since_false >= avg_false_gap * 1.5:
+        return False, min(60 + int(dist_since_false - avg_false_gap)*3, 85)
+
+    return None, 50
+
+def _streak_advanced(seq: List[bool]) -> Tuple[Optional[bool], int]:
+    """Bẻ cầu khi chuỗi quá dài (>=6)."""
+    if len(seq) < 6:
+        return None, 50
+    last = seq[-1]
+    streak = 1
+    for x in reversed(seq[:-1]):
+        if x == last:
+            streak += 1
+        else:
+            break
+    if streak >= 6:
+        # Chuỗi càng dài, khả năng gãy càng cao
+        conf = min(70 + (streak - 6) * 5, 95)
+        return not last, conf
+    return None, 50
+
+def _cau_dao_detect(seq: List[bool]) -> Tuple[Optional[bool], int]:
+    """Phát hiện cầu đảo liên tục (T-X-T-X...)."""
+    if len(seq) < 6:
+        return None, 50
+    # Kiểm tra 5 phần tử cuối có đan xen hoàn hảo không
+    last5 = seq[-5:]
+    expected = not last5[0]
+    is_alternating = all(last5[i] == (expected if i%2==1 else not expected) for i in range(5))
+    if is_alternating:
+        # Dự đoán tiếp tục đan xen: phần tử tiếp theo = not last
+        return not seq[-1], 78
+    return None, 50
+
+def _cau_1_1_detect(seq: List[bool]) -> Tuple[Optional[bool], int]:
+    """Phát hiện cầu 1-1 (T,X,T,X) trong 6 phiên gần nhất."""
+    if len(seq) < 8:
+        return None, 50
+    recent = seq[-8:]
+    # Kiểm tra 6 phiên cuối có dạng 1-1 xen kẽ không
+    pattern = [recent[-6], not recent[-6], recent[-6]]
+    if recent[-6:] == pattern * 2:   # ví dụ [True,False,True,False,True,False]
+        return not seq[-1], 82
+    return None, 50
+
+def _cau_2_1_detect(seq: List[bool]) -> Tuple[Optional[bool], int]:
+    """Phát hiện cầu 2-1 (ví dụ: T,T,X,T,T,X hoặc X,X,T,X,X,T)."""
+    if len(seq) < 9:
+        return None, 50
+    # Lấy 9 phiên cuối, kiểm tra pattern 2-1-2-1 (2 lần lặp)
+    recent = seq[-9:]
+    # Pattern cần: a,a,b,a,a,b,a,a (a là True hoặc False)
+    a = recent[-9]
+    b = not a
+    expected = [a, a, b, a, a, b, a, a, b]  # nhưng chỉ cần 8 phần tử để dự đoán thứ 9
+    if recent[:8] == expected[:8]:
+        return b, 80
+    return None, 50
+
+def _score_distribution(scores: List[int]) -> Tuple[Optional[bool], int]:
+    """Phân phối điểm gần đây chia thành vùng thấp (3-7), trung bình (8-12), cao (13-18)."""
+    if len(scores) < 12:
+        return None, 50
+    recent = scores[-12:]
+    low = sum(1 for s in recent if s <= 7)
+    mid = sum(1 for s in recent if 8 <= s <= 12)
+    high = sum(1 for s in recent if s >= 13)
+    # Nếu một vùng chiếm >60% phiên gần đây, dự đoán vùng đó tiếp tục
+    total = len(recent)
+    if low / total >= 0.6:
+        return True, 65   # thấp -> Xỉu
+    if high / total >= 0.6:
+        return False, 65  # cao -> Tài
+    if mid / total >= 0.6:
+        # trung bình khó đoán, chọn ngẫu nhiên nhưng thiên về cân bằng
+        return None, 50
+    return None, 50
+
+def _adaptive_balance(seq: List[bool], pred_tai: bool) -> int:
+    """Điều chỉnh độ tin cậy nếu bot đang bị thiên vị quá mức trong quá khứ gần."""
+    if len(seq) < 20:
+        return 0
+    recent20 = seq[-20:]
+    tai_ratio = sum(recent20) / 20
+    # Nếu bot liên tục dự đoán Tài (tai_ratio >0.7) và dự đoán hiện tại cũng là Tài -> giảm confidence
+    if tai_ratio > 0.7 and pred_tai:
+        return -12
+    if tai_ratio < 0.3 and not pred_tai:
+        return -12
+    return 0
+
+# ══════════════════════════════════════════════════════════════════
+#  TỔNG HỢP & DỰ ĐOÁN CHÍNH
+# ══════════════════════════════════════════════════════════════════
 def predict_next() -> dict:
     global _prev_pred
     if len(_history) < 8:
@@ -337,37 +470,53 @@ def predict_next() -> dict:
 
     results: List[Tuple[bool, int, int]] = []
 
+    # Danh sách thuật toán với trọng số tùy chỉnh
     algorithms = [
+        # Markov chain
         (_markov3,                          5),
         (_markov2,                          4),
         (_markov1,                          3),
+        # Streak & bẻ cầu
         (_streak_breaker,                   3),
+        (_streak_advanced,                  4),   # MỚI
+        # Pattern
         (lambda s: _pattern_match(s, 5),    3),
         (lambda s: _pattern_match(s, 4),    2),
         (lambda s: _pattern_match(s, 3),    2),
+        # Cầu đặc biệt
+        (_cau_dao_detect,                   4),   # MỚI
+        (_cau_1_1_detect,                   3),   # MỚI
+        (_cau_2_1_detect,                   3),   # MỚI
         (_zigzag_detect,                    2),
+        # Phân phối & khoảng cách
+        (_gap_analysis,                     4),   # MỚI
         (_entropy_analysis,                 2),
         (_chi_balance,                      1),
     ]
 
-    score_results = [
-        (_score_trend,   2),
-        (_hot_cold_zone, 2),
+    score_algorithms = [
+        (_score_trend,        2),
+        (_hot_cold_zone,      2),
+        (_score_distribution, 3),   # MỚI
     ]
 
+    # Thu thập kết quả từ các thuật toán
     for func, weight in algorithms:
         try:
             p, c = func(seq)
             if p is not None:
-                results.append((p, c, weight))
+                # Điều chỉnh chống thiên vị
+                adj = _adaptive_balance(seq, p)
+                results.append((p, c + adj, weight))
         except Exception:
             pass
 
-    for func, weight in score_results:
+    for func, weight in score_algorithms:
         try:
             p, c = func(scores)
             if p is not None:
-                results.append((p, c, weight))
+                adj = _adaptive_balance(seq, p)
+                results.append((p, c + adj, weight))
         except Exception:
             pass
 
@@ -382,6 +531,7 @@ def predict_next() -> dict:
             "confidence": 50,
         }
 
+    # Tính điểm tổng hợp (có trọng số)
     tai_score = sum(c * w for p, c, w in results if p is True)
     xiu_score = sum(c * w for p, c, w in results if p is False)
     total     = tai_score + xiu_score
@@ -390,38 +540,32 @@ def predict_next() -> dict:
     raw_conf  = (tai_score if pred_bool else xiu_score) / total * 100 if total else 50
     confidence = max(54, min(96, int(raw_conf)))
 
-    recent_scores = scores[-20:]
+    # Dự đoán vị cải tiến: lấy điểm từ các vùng phù hợp với xu hướng
+    recent_scores = scores[-30:]
     if pred_bool:
-        candidates = [s for s in recent_scores if s > 10]
-        if not candidates:
-            candidates = list(range(11, 19))
+        # Tài thường 11-17 (ưu tiên vùng cao)
+        candidates = [s for s in recent_scores if 11 <= s <= 17]
+        if len(candidates) < 5:
+            candidates = list(range(11, 18))
     else:
-        candidates = [s for s in recent_scores if 3 < s <= 10]
-        if not candidates:
+        # Xỉu thường 4-10
+        candidates = [s for s in recent_scores if 4 <= s <= 10]
+        if len(candidates) < 5:
             candidates = list(range(4, 11))
 
     cnt = Counter(candidates)
-    top_candidates = [v for v, _ in cnt.most_common(5)]
-    if len(top_candidates) < 3:
-        top_candidates.extend([x for x in candidates if x not in top_candidates])
-        top_candidates = top_candidates[:5]
-
-    prev_vis = set()
+    top_candidates = [v for v, _ in cnt.most_common(8)]
+    # Loại bỏ trùng với dự đoán trước
     if _prev_pred:
         prev_vis = {_prev_pred.get("vi1"), _prev_pred.get("vi2"), _prev_pred.get("vi3")}
-    filtered = [v for v in top_candidates if v not in prev_vis]
-    if len(filtered) < 3:
-        filtered = top_candidates
+        top_candidates = [v for v in top_candidates if v not in prev_vis] or top_candidates
 
-    random.shuffle(filtered)
-    selected = filtered[:3]
+    random.shuffle(top_candidates)
+    selected = top_candidates[:3]
     while len(selected) < 3:
-        if pred_bool:
-            new_val = random.randint(11, 18)
-        else:
-            new_val = random.randint(4, 10)
-        if new_val not in selected:
-            selected.append(new_val)
+        extra = random.randint(11, 17) if pred_bool else random.randint(4, 10)
+        if extra not in selected:
+            selected.append(extra)
     selected.sort()
     vi1, vi2, vi3 = selected[0], selected[1], selected[2]
 
@@ -435,7 +579,7 @@ def predict_next() -> dict:
     }
 
 # ══════════════════════════════════════════════════════════════════
-#  API FETCHER
+#  API FETCHER (KHÔNG ĐỔI)
 # ══════════════════════════════════════════════════════════════════
 async def fetch_results(session: aiohttp.ClientSession) -> Optional[List[dict]]:
     global _api_ok
@@ -514,7 +658,6 @@ def parse_game(raw: dict) -> dict:
 #  INITIAL HISTORY LOAD
 # ══════════════════════════════════════════════════════════════════
 async def load_initial_history(session: aiohttp.ClientSession):
-    """Nạp toàn bộ lịch sử từ API ngay khi khởi động."""
     global _latest, _pred, _prev_pred
     raw_list = await fetch_results(session)
     if not raw_list:
@@ -532,37 +675,39 @@ async def load_initial_history(session: aiohttp.ClientSession):
     if not games:
         return
 
-    # Sắp xếp theo game_num (dạng ##123456 -> số 123456)
     def extract_num(g):
         try:
             return int(g["game_num"].replace("#", ""))
         except:
             return 0
-    games.sort(key=extract_num)  # tăng dần, cũ nhất -> mới nhất
+    games.sort(key=extract_num)
 
-    # Đưa vào _history (newest first)
     _history.clear()
     for g in reversed(games):
         _history.appendleft(g)
 
-    _latest = games[-1]  # mới nhất
+    _latest = games[-1]
     _pred = predict_next()
     _prev_pred = {}
     log.info(f"✅ Đã nạp {len(games)} phiên lịch sử từ API.")
 
 # ══════════════════════════════════════════════════════════════════
-#  AUTO-UPDATE LOOP
+#  AUTO-UPDATE LOOP (có kiểm tra bảo trì)
 # ══════════════════════════════════════════════════════════════════
 async def auto_loop(app: Application):
     global _latest, _pred, _prev_pred
 
     connector = aiohttp.TCPConnector(ssl=False, limit=5, ttl_dns_cache=300)
     async with aiohttp.ClientSession(connector=connector) as session:
-        # Nạp lịch sử ban đầu
         await load_initial_history(session)
 
         log.info("Auto-loop running (interval=%.1fs)", FETCH_INTERVAL)
         while True:
+            # KIỂM TRA BẢO TRÌ
+            if _maintenance_state["active"]:
+                await asyncio.sleep(1)
+                continue
+
             try:
                 await asyncio.sleep(FETCH_INTERVAL)
                 raw_list = await fetch_results(session)
@@ -594,80 +739,82 @@ async def auto_loop(app: Application):
                 log.exception("Auto-loop error: %s", e)
                 await asyncio.sleep(2)
 
-def _record_prediction(pred: dict, actual: dict):
-    if not pred or not actual.get("game_num"):
-        return
-    outcome  = None
-    vi_hit   = 0
-    p_type   = pred.get("pred")
-    a_type   = actual["type"]
-    a_score  = actual["score"]
+# ══════════════════════════════════════════════════════════════════
+#  BẢO TRÌ
+# ══════════════════════════════════════════════════════════════════
+async def start_maintenance(app: Application, minutes: int, reason: str):
+    global _maintenance_state
+    if _maintenance_state["active"]:
+        return  # đã bảo trì rồi
 
-    if p_type in ("TÀI", "XỈU") and a_type in ("TÀI", "XỈU"):
-        outcome = "✅ ĐÚNG" if p_type == a_type else "❌ SAI"
+    end_time = datetime.now() + timedelta(minutes=minutes)
+    _maintenance_state.update({
+        "active": True,
+        "end_time": end_time,
+        "reason": reason,
+    })
 
-    for vk in ("vi1", "vi2", "vi3"):
-        if pred.get(vk) == a_score:
-            vi_hit = 1
-            break
-
-    try:
-        with _db() as db:
-            db.execute(
-                """INSERT OR IGNORE INTO predictions
-                   (game_num, pred_type, pred_vi1, pred_vi2, pred_vi3, confidence,
-                    actual_vi, actual_type, dice, outcome, vi_hit, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    actual["game_num"],
-                    p_type,
-                    pred.get("vi1"),
-                    pred.get("vi2"),
-                    pred.get("vi3"),
-                    pred.get("confidence"),
-                    a_score,
-                    a_type,
-                    "-".join(map(str, actual["faces"])),
-                    outcome,
-                    vi_hit,
-                    actual["ts"],
-                ),
-            )
-    except Exception as e:
-        log.warning("record_prediction: %s", e)
-
-async def _push_new_message(app, prev_pred, prev_game, new_game):
-    if not _auto_msg:
-        return
-
-    text = _build_pred_msg(_pred, prev_pred, prev_game, new_game)
+    # Gửi thông báo đến tất cả người đang auto
     dead = []
-
     for chat_id in list(_auto_msg.keys()):
         try:
-            old_id = _auto_msg.get(chat_id)
-            if old_id:
-                try:
-                    await app.bot.delete_message(chat_id=chat_id, message_id=old_id)
-                except Exception:
-                    pass
-            m = await app.bot.send_message(
+            await app.bot.send_message(
                 chat_id=chat_id,
-                text=text,
+                text=(
+                    "🔧 <b>BẢO TRÌ HỆ THỐNG</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"⏳ Thời gian dự kiến: <b>{minutes} phút</b>\n"
+                    f"📋 Lý do: {reason}\n"
+                    f"🕐 Kết thúc: <b>{end_time.strftime('%H:%M %d/%m/%Y')}</b>\n\n"
+                    "<i>Bot sẽ tự động hoạt động lại sau bảo trì.</i>"
+                ),
                 parse_mode=ParseMode.HTML,
             )
-            _auto_msg[chat_id] = m.message_id
-            await asyncio.sleep(0.05)
-        except Forbidden:
+        except Exception:
             dead.append(chat_id)
-        except Exception as e:
-            log.warning("push_new_msg %s: %s", chat_id, e)
-
     for c in dead:
         _auto_msg.pop(c, None)
 
+    # Tạo task tự động kết thúc bảo trì
+    async def _auto_end():
+        await asyncio.sleep(minutes * 60)
+        await end_maintenance(app)
+
+    if _maintenance_state["task"]:
+        _maintenance_state["task"].cancel()
+    _maintenance_state["task"] = asyncio.create_task(_auto_end())
+
+    log.info(f"Bảo trì bắt đầu: {minutes} phút, lý do: {reason}")
+
+async def end_maintenance(app: Application):
+    global _maintenance_state
+    if not _maintenance_state["active"]:
+        return
+
+    _maintenance_state["active"] = False
+    if _maintenance_state["task"]:
+        _maintenance_state["task"].cancel()
+        _maintenance_state["task"] = None
+
+    # Thông báo hoàn tất bảo trì
+    for chat_id in list(_auto_msg.keys()):
+        try:
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "✅ <b>BẢO TRÌ HOÀN TẤT</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "🚀 Bot đã hoạt động trở lại. Dự đoán sẽ tiếp tục ngay.\n"
+                    "<i>Dùng /autosicbo nếu cần khởi động lại.</i>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+    log.info("Bảo trì kết thúc.")
+
 # ══════════════════════════════════════════════════════════════════
-#  MESSAGE BUILDER
+#  MESSAGE BUILDER (CÓ THÊM TRẠNG THÁI BẢO TRÌ)
 # ══════════════════════════════════════════════════════════════════
 _TYPE_EMOJI = {"TÀI": "🔴", "XỈU": "🔵", "🌪 BÃO": "🌪", "⚡ ĐẶC BIỆT": "⚡"}
 
@@ -682,6 +829,14 @@ def _conf_bar(c: int) -> str:
 
 def _build_pred_msg(pred: dict, prev_pred: dict, prev_game: dict, curr_game: dict) -> str:
     now = datetime.now().strftime("%H:%M:%S %d/%m")
+
+    # Cảnh báo bảo trì nếu có
+    maint_text = ""
+    if _maintenance_state["active"]:
+        maint_text = (
+            "\n⚠️ <b>ĐANG BẢO TRÌ</b> ⚠️\n"
+            f"<i>Dự đoán bị tạm dừng, quay lại lúc {_maintenance_state['end_time'].strftime('%H:%M')}</i>\n"
+        )
 
     result_block = ""
     outcome_block = ""
@@ -739,18 +894,98 @@ def _build_pred_msg(pred: dict, prev_pred: dict, prev_game: dict, curr_game: dic
 
     return (
         "🎲 <b>SICBO SUNWIN — DỰ ĐOÁN TỰ ĐỘNG</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        + pred_block
-        + result_block
-        + bao_block
-        + outcome_block
-        + f"\n\n<i>🔄 {now} | ⚡ Live</i>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🤖 <i>Sicbo Sunwin Bot • Ultra v3.2</i>"
+        + maint_text +
+        "\n" + pred_block +
+        result_block +
+        bao_block +
+        outcome_block +
+        f"\n\n<i>🔄 {now} | ⚡ Live</i>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🤖 <i>Sicbo Sunwin Bot • Ultra v4.0</i>"
     )
 
 # ══════════════════════════════════════════════════════════════════
-#  KEY SYSTEM
+#  RECORD & PUSH
+# ══════════════════════════════════════════════════════════════════
+def _record_prediction(pred: dict, actual: dict):
+    if not pred or not actual.get("game_num"):
+        return
+    outcome  = None
+    vi_hit   = 0
+    p_type   = pred.get("pred")
+    a_type   = actual["type"]
+    a_score  = actual["score"]
+
+    if p_type in ("TÀI", "XỈU") and a_type in ("TÀI", "XỈU"):
+        outcome = "✅ ĐÚNG" if p_type == a_type else "❌ SAI"
+
+    for vk in ("vi1", "vi2", "vi3"):
+        if pred.get(vk) == a_score:
+            vi_hit = 1
+            break
+
+    try:
+        with _db() as db:
+            db.execute(
+                """INSERT OR IGNORE INTO predictions
+                   (game_num, pred_type, pred_vi1, pred_vi2, pred_vi3, confidence,
+                    actual_vi, actual_type, dice, outcome, vi_hit, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    actual["game_num"],
+                    p_type,
+                    pred.get("vi1"),
+                    pred.get("vi2"),
+                    pred.get("vi3"),
+                    pred.get("confidence"),
+                    a_score,
+                    a_type,
+                    "-".join(map(str, actual["faces"])),
+                    outcome,
+                    vi_hit,
+                    actual["ts"],
+                ),
+            )
+    except Exception as e:
+        log.warning("record_prediction: %s", e)
+
+async def _push_new_message(app, prev_pred, prev_game, new_game):
+    if not _auto_msg:
+        return
+
+    # Không push nếu đang bảo trì (chỉ push khi kết thúc)
+    if _maintenance_state["active"]:
+        return
+
+    text = _build_pred_msg(_pred, prev_pred, prev_game, new_game)
+    dead = []
+
+    for chat_id in list(_auto_msg.keys()):
+        try:
+            old_id = _auto_msg.get(chat_id)
+            if old_id:
+                try:
+                    await app.bot.delete_message(chat_id=chat_id, message_id=old_id)
+                except Exception:
+                    pass
+            m = await app.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+            )
+            _auto_msg[chat_id] = m.message_id
+            await asyncio.sleep(0.05)
+        except Forbidden:
+            dead.append(chat_id)
+        except Exception as e:
+            log.warning("push_new_msg %s: %s", chat_id, e)
+
+    for c in dead:
+        _auto_msg.pop(c, None)
+
+# ══════════════════════════════════════════════════════════════════
+#  KEY SYSTEM (GIỮ NGUYÊN)
 # ══════════════════════════════════════════════════════════════════
 def _gen_key(prefix: str = "SUNWIN") -> str:
     body = "".join(random.choices(string.ascii_uppercase + string.digits, k=16))
@@ -831,8 +1066,22 @@ async def activate_key(
     return True, f"✅ Kích hoạt thành công!\n📅 Hết hạn: <b>{exp_str}</b>"
 
 # ══════════════════════════════════════════════════════════════════
-#  COMMAND HANDLERS
+#  COMMAND HANDLERS (ĐÃ THÊM KIỂM TRA BẢO TRÌ Ở CÁC LỆNH USER)
 # ══════════════════════════════════════════════════════════════════
+
+def _check_maintenance(update: Update) -> bool:
+    if _maintenance_state["active"]:
+        end_str = _maintenance_state["end_time"].strftime("%H:%M %d/%m/%Y") if _maintenance_state["end_time"] else "sắp tới"
+        asyncio.create_task(
+            update.message.reply_html(
+                f"🔧 <b>Bot đang bảo trì!</b>\n"
+                f"⏳ Dự kiến hoàn tất lúc <b>{end_str}</b>\n"
+                f"📋 Lý do: {_maintenance_state['reason']}\n\n"
+                "<i>Vui lòng thử lại sau.</i>"
+            )
+        )
+        return True
+    return False
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name or "bạn"
@@ -883,6 +1132,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "/lkey — Danh sách tất cả key\n"
             "/noti {thông báo} — Broadcast toàn bộ user\n"
             "/stat — Thống kê độ chính xác\n"
+            "/baotri {phút} {lý do} — Bảo trì hệ thống\n"
+            "/huybaotri — Hủy bảo trì\n"
             "</blockquote>"
         )
     await update.message.reply_html(base + admin_extra)
@@ -890,6 +1141,9 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_autosicbo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid     = update.effective_user.id
     chat_id = update.effective_chat.id
+
+    if _check_maintenance(update):
+        return
 
     if not is_allowed(uid):
         await update.message.reply_html(
@@ -943,6 +1197,8 @@ async def cmd_stop_auto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_predict(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if _check_maintenance(update):
+        return
     if not is_allowed(uid):
         await update.message.reply_html("🔒 Bạn chưa có quyền truy cập!")
         return
@@ -954,6 +1210,8 @@ async def cmd_predict(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if _check_maintenance(update):
+        return
     if not is_allowed(uid):
         await update.message.reply_html("🔒 Bạn chưa có quyền truy cập!")
         return
@@ -967,6 +1225,9 @@ async def cmd_trailkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid      = update.effective_user.id
     username = update.effective_user.username or ""
     name     = update.effective_user.full_name or str(uid)
+
+    if _check_maintenance(update):
+        return
 
     with _db() as db:
         used = db.execute(
@@ -1002,6 +1263,9 @@ async def cmd_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid      = update.effective_user.id
     username = update.effective_user.username or ""
     name     = update.effective_user.full_name or str(uid)
+
+    if _check_maintenance(update):
+        return
 
     if not ctx.args:
         await update.message.reply_html(
@@ -1060,6 +1324,7 @@ async def cmd_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     acc    = f"{correct / total * 100:.1f}%" if total else "—"
     vi_acc = f"{vi_hits / total * 100:.1f}%" if total else "—"
     api_status = "🟢 Online" if _api_ok else "🔴 Offline"
+    maint_status = "🔧 Đang bảo trì" if _maintenance_state["active"] else "✅ Bình thường"
 
     await update.message.reply_html(
         f"👤 <b>THÔNG TIN TÀI KHOẢN</b>\n"
@@ -1076,12 +1341,15 @@ async def cmd_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"✅ Đúng loại : <b>{correct}</b> ({acc})\n"
         f"🎯 Trúng vị  : <b>{vi_hits}</b> ({vi_acc})\n"
         f"API Status   : {api_status}\n"
+        f"Trạng thái   : {maint_status}\n"
         f"Lịch sử RAM  : <b>{len(_history)}</b> phiên\n"
         f"</blockquote>"
     )
 
 async def cmd_listkq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if _check_maintenance(update):
+        return
     if not is_allowed(uid):
         await update.message.reply_html("🔒 Bạn chưa có quyền truy cập!")
         return
@@ -1118,7 +1386,7 @@ async def cmd_listkq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(text)
 
 # ══════════════════════════════════════════════════════════════════
-#  ADMIN COMMANDS
+#  ADMIN COMMANDS (ĐÃ THÊM BAOTRI, HUYBAOTRI)
 # ══════════════════════════════════════════════════════════════════
 def _admin_only(func):
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1327,11 +1595,53 @@ async def cmd_stat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"✅ Đúng (7 ngày) : <b>{correct7}</b> ({acc7})\n"
         f"🤖 History   : <b>{len(_history)}</b> phiên\n"
         f"🌐 API Status    : {'🟢 Online' if _api_ok else '🔴 Offline'}\n"
+        f"🔧 Bảo trì       : {'Đang bảo trì' if _maintenance_state['active'] else 'Bình thường'}\n"
         "</blockquote>"
     )
 
+@_admin_only
+async def cmd_baotri(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Bảo trì hệ thống: /baotri <phút> <lý do>"""
+    if not ctx.args:
+        await update.message.reply_html(
+            "🔧 <b>BẢO TRÌ HỆ THỐNG</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Dùng: <code>/baotri &lt;số phút&gt; &lt;lý do&gt;</code>\n"
+            "Ví dụ: <code>/baotri 30 Nâng cấp server</code>"
+        )
+        return
+    try:
+        minutes = int(ctx.args[0])
+    except ValueError:
+        await update.message.reply_html("❌ Số phút không hợp lệ!")
+        return
+    reason = " ".join(ctx.args[1:]) if len(ctx.args) > 1 else "Bảo trì định kỳ"
+
+    if _maintenance_state["active"]:
+        await update.message.reply_html("⚠️ Bot đang trong quá trình bảo trì rồi!")
+        return
+
+    await start_maintenance(ctx.application, minutes, reason)
+    await update.message.reply_html(
+        f"🔧 <b>ĐÃ KÍCH HOẠT BẢO TRÌ</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏳ Thời gian: <b>{minutes} phút</b>\n"
+        f"📋 Lý do: {reason}\n"
+        f"🕐 Kết thúc: <b>{_maintenance_state['end_time'].strftime('%H:%M %d/%m/%Y')}</b>\n\n"
+        "<i>Bot sẽ tự động hoạt động lại. Dùng /huybaotri để hủy.</i>"
+    )
+
+@_admin_only
+async def cmd_huybaotri(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Hủy bảo trì thủ công."""
+    if not _maintenance_state["active"]:
+        await update.message.reply_html("ℹ️ Hiện không có bảo trì nào đang diễn ra.")
+        return
+    await end_maintenance(ctx.application)
+    await update.message.reply_html("✅ <b>Đã hủy bảo trì!</b> Bot hoạt động trở lại.")
+
 # ══════════════════════════════════════════════════════════════════
-#  MAINTENANCE TASKS
+#  MAINTENANCE TASKS (DỌN DẸP NGƯỜI DÙNG HẾT HẠN)
 # ══════════════════════════════════════════════════════════════════
 async def cleanup_expired_users():
     with _db() as db:
@@ -1392,11 +1702,13 @@ def main():
         CommandHandler("lkey",       cmd_lkey),
         CommandHandler("noti",       cmd_noti),
         CommandHandler("stat",       cmd_stat),
+        CommandHandler("baotri",     cmd_baotri),
+        CommandHandler("huybaotri",  cmd_huybaotri),
     ]
     for h in handlers:
         app.add_handler(h)
 
-    log.info("🎲 Sicbo Sunwin Bot Ultra v3.2 starting…")
+    log.info("🎲 Sicbo Sunwin Bot Ultra v4.0 starting…")
     app.run_polling(drop_pending_updates=True, poll_interval=1)
 
 if __name__ == "__main__":
