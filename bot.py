@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║      🎲  SICBO SUNWIN BOT  — Ultra Edition v4.0                ║
-║   Bảo trì thông minh • Dự đoán đa tầng • Siêu chính xác       ║
+║      🎲  SICBO SUNWIN BOT  — Ultra Edition v5.0                ║
+║   Bão chỉ 4-4-4 • Ensemble thích ứng • Dự đoán siêu ổn định   ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -11,13 +11,14 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import sqlite3
 import string
-from collections import Counter, deque
+from collections import Counter, deque, defaultdict
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import aiohttp
 from telegram import Update
@@ -57,7 +58,7 @@ BASE_HEADERS = {
 
 FETCH_INTERVAL = 2.5
 DB_PATH        = "sicbo.db"
-MEM_WINDOW     = 200
+MEM_WINDOW     = 300            # mở rộng vùng nhớ cho thuật toán dài hạn
 MAX_RETRIES    = 3
 
 logging.basicConfig(
@@ -70,7 +71,7 @@ log = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════
 #  GLOBAL STATE
 # ══════════════════════════════════════════════════════════════════
-_history:   deque = deque(maxlen=MEM_WINDOW)
+_history:   deque = deque(maxlen=MEM_WINDOW)   # newest first
 _latest:    dict  = {}
 _pred:      dict  = {}
 _auto_msg:  dict  = {}
@@ -84,6 +85,9 @@ _maintenance_state = {
     "reason": "",
     "task": None
 }
+
+# Bộ đếm sai liên tiếp gần đây (dùng trong engine)
+_recent_results = deque(maxlen=50)   # lưu tuple (pred_bool, actual_tai, conf)
 
 # ══════════════════════════════════════════════════════════════════
 #  DATABASE
@@ -130,6 +134,13 @@ def init_db():
                 vi_hit      INTEGER DEFAULT 0,
                 created_at  TEXT
             );
+            CREATE TABLE IF NOT EXISTS algo_weights (
+                algo_name TEXT PRIMARY KEY,
+                weight    REAL DEFAULT 1.0,
+                hits      INTEGER DEFAULT 0,
+                misses    INTEGER DEFAULT 0,
+                updated   TEXT
+            );
         """)
     log.info("Database initialised.")
 
@@ -160,18 +171,17 @@ def is_allowed(uid: int) -> bool:
     return True
 
 # ══════════════════════════════════════════════════════════════════
-#  GAME LOGIC
+#  GAME LOGIC (CHỈ BÃO 4-4-4)
 # ══════════════════════════════════════════════════════════════════
 def classify(score: int, faces: list) -> str:
     if faces == [4, 4, 4]:
         return "🌪 BÃO"
-    if len(set(faces)) == 1:
-        return "⚡ ĐẶC BIỆT"
+    # Các bộ ba khác vẫn tính Tài/Xỉu theo tổng điểm
     if score > 10:
         return "TÀI"
-    if score > 3:
+    if score >= 3:   # 3 <= score <= 10
         return "XỈU"
-    return "⚡ ĐẶC BIỆT"
+    return "XỈU"  # không thể xảy ra vì score >=3
 
 def is_tai(score: int, faces: list) -> Optional[bool]:
     t = classify(score, faces)
@@ -179,407 +189,521 @@ def is_tai(score: int, faces: list) -> Optional[bool]:
         return True
     if t == "XỈU":
         return False
+    # BÃO 4-4-4 không phải Tài/Xỉu -> None
     return None
 
 # ══════════════════════════════════════════════════════════════════
-#  PREDICTION ENGINE (NÂNG CẤP TOÀN DIỆN)
+#  PREDICTION ENGINE (ENSEMBLE THÍCH ỨNG)
 # ══════════════════════════════════════════════════════════════════
+class PredictionEngine:
+    def __init__(self):
+        self.algo_weights: Dict[str, float] = {}
+        self.algo_perf: Dict[str, dict] = defaultdict(lambda: {"hits":0,"misses":0,"total":0})
+        self.load_weights()
+        self.consecutive_losses = 0
+        self.last_pred_type = None
 
-# --- Các thuật toán gốc đã có (vẫn giữ) ---
-def _markov2(seq: List[bool]) -> Tuple[Optional[bool], int]:
-    if len(seq) < 8:
-        return None, 50
-    pattern = (seq[-2], seq[-1])
-    counts: Counter = Counter()
-    for i in range(len(seq) - 2):
-        if (seq[i], seq[i + 1]) == pattern:
-            counts[seq[i + 2]] += 1
-    total = sum(counts.values())
-    if total < 3:
-        return None, 50
-    best_val, best_cnt = counts.most_common(1)[0]
-    conf = int(best_cnt / total * 100)
-    return best_val, conf
-
-def _markov1(seq: List[bool]) -> Tuple[Optional[bool], int]:
-    if len(seq) < 6:
-        return None, 50
-    last = seq[-1]
-    counts: Counter = Counter()
-    for i in range(len(seq) - 1):
-        if seq[i] == last:
-            counts[seq[i + 1]] += 1
-    total = sum(counts.values())
-    if total < 3:
-        return None, 50
-    best_val, best_cnt = counts.most_common(1)[0]
-    conf = int(best_cnt / total * 100)
-    return best_val, conf
-
-def _markov3(seq: List[bool]) -> Tuple[Optional[bool], int]:
-    if len(seq) < 12:
-        return None, 50
-    pattern = (seq[-3], seq[-2], seq[-1])
-    counts: Counter = Counter()
-    for i in range(len(seq) - 3):
-        if (seq[i], seq[i+1], seq[i+2]) == pattern:
-            if i + 3 < len(seq):
-                counts[seq[i + 3]] += 1
-    total = sum(counts.values())
-    if total < 2:
-        return None, 50
-    best_val, best_cnt = counts.most_common(1)[0]
-    conf = int(best_cnt / total * 100)
-    return best_val, max(conf, 50)
-
-def _streak_breaker(seq: List[bool]) -> Tuple[Optional[bool], int]:
-    if len(seq) < 3:
-        return None, 50
-    last = seq[-1]
-    streak = 1
-    for x in reversed(seq[:-1]):
-        if x == last:
-            streak += 1
-        else:
-            break
-    if streak >= 3:
-        conf = min(52 + streak * 7, 87)
-        return not last, conf
-    return None, 50
-
-def _pattern_match(seq: List[bool], depth: int = 4) -> Tuple[Optional[bool], int]:
-    if len(seq) < depth + 2:
-        return None, 50
-    pattern = tuple(seq[-depth:])
-    votes: Counter = Counter()
-    for i in range(len(seq) - depth):
-        if tuple(seq[i: i + depth]) == pattern:
-            if i + depth < len(seq):
-                votes[seq[i + depth]] += 1
-    total = sum(votes.values())
-    if total < 2:
-        return None, 50
-    best_val, best_cnt = votes.most_common(1)[0]
-    conf = int(best_cnt / total * 100)
-    return best_val, max(conf, 50)
-
-def _score_trend(scores: List[int]) -> Tuple[Optional[bool], int]:
-    if len(scores) < 8:
-        return None, 50
-    recent = scores[-4:]
-    older  = scores[-8:-4]
-    r_avg  = sum(recent) / len(recent)
-    o_avg  = sum(older)  / len(older)
-    diff   = r_avg - o_avg
-    if abs(diff) < 0.8:
-        return None, 50
-    pred_tai = diff > 0
-    conf = min(50 + int(abs(diff) * 5), 80)
-    return pred_tai, conf
-
-def _chi_balance(seq: List[bool]) -> Tuple[Optional[bool], int]:
-    window = seq[-20:] if len(seq) >= 20 else seq
-    if not window:
-        return None, 50
-    tai_pct = sum(window) / len(window)
-    if abs(tai_pct - 0.5) < 0.1:
-        return None, 50
-    pred_tai = tai_pct < 0.5
-    conf = min(50 + int(abs(tai_pct - 0.5) * 80), 74)
-    return pred_tai, conf
-
-def _zigzag_detect(seq: List[bool]) -> Tuple[Optional[bool], int]:
-    if len(seq) < 6:
-        return None, 50
-    zigzag = all(seq[-(i+1)] != seq[-(i+2)] for i in range(4))
-    if zigzag:
-        return not seq[-1], 72
-    return None, 50
-
-def _hot_cold_zone(scores: List[int]) -> Tuple[Optional[bool], int]:
-    if len(scores) < 15:
-        return None, 50
-    recent = scores[-30:]
-    hot_tai = sum(1 for s in recent if s > 13)
-    hot_xiu = sum(1 for s in recent if s < 7)
-    last5   = scores[-5:]
-    avg5    = sum(last5) / len(last5)
-    if avg5 > 14 and hot_tai > 10:
-        return False, 68
-    if avg5 < 6 and hot_xiu > 10:
-        return True, 68
-    return None, 50
-
-def _entropy_analysis(seq: List[bool]) -> Tuple[Optional[bool], int]:
-    if len(seq) < 10:
-        return None, 50
-    window = seq[-10:]
-    tai_count = sum(window)
-    xiu_count = len(window) - tai_count
-    if tai_count >= 8:
-        return False, 75
-    if xiu_count >= 8:
-        return True, 75
-    return None, 50
-
-# --- THUẬT TOÁN MỚI (BẮT CẦU, BẺ CẦU, PHÂN TÍCH KHOẢNG CÁCH) ---
-
-def _gap_analysis(seq: List[bool]) -> Tuple[Optional[bool], int]:
-    """Phân tích khoảng cách giữa các lần xuất hiện Tài / Xỉu."""
-    if len(seq) < 10:
-        return None, 50
-    # Lấy vị trí các lần True (Tài) và False (Xỉu)
-    true_pos = [i for i, v in enumerate(seq) if v]
-    false_pos = [i for i, v in enumerate(seq) if not v]
-    if len(true_pos) < 3 or len(false_pos) < 3:
-        return None, 50
-
-    # Khoảng cách trung bình giữa các lần xuất hiện
-    true_gaps = [true_pos[i+1] - true_pos[i] for i in range(len(true_pos)-1)]
-    false_gaps = [false_pos[i+1] - false_pos[i] for i in range(len(false_pos)-1)]
-    avg_true_gap = sum(true_gaps) / len(true_gaps)
-    avg_false_gap = sum(false_gaps) / len(false_gaps)
-
-    last_true_pos = true_pos[-1]
-    last_false_pos = false_pos[-1]
-    current_pos = len(seq) - 1
-
-    # Khoảng cách từ lần cuối cùng đến hiện tại
-    dist_since_true = current_pos - last_true_pos
-    dist_since_false = current_pos - last_false_pos
-
-    # Nếu khoảng cách vượt ngưỡng trung bình + 1.5, dự đoán sự kiện đó sắp xảy ra
-    if dist_since_true >= avg_true_gap * 1.5:
-        return True, min(60 + int(dist_since_true - avg_true_gap)*3, 85)
-    if dist_since_false >= avg_false_gap * 1.5:
-        return False, min(60 + int(dist_since_false - avg_false_gap)*3, 85)
-
-    return None, 50
-
-def _streak_advanced(seq: List[bool]) -> Tuple[Optional[bool], int]:
-    """Bẻ cầu khi chuỗi quá dài (>=6)."""
-    if len(seq) < 6:
-        return None, 50
-    last = seq[-1]
-    streak = 1
-    for x in reversed(seq[:-1]):
-        if x == last:
-            streak += 1
-        else:
-            break
-    if streak >= 6:
-        # Chuỗi càng dài, khả năng gãy càng cao
-        conf = min(70 + (streak - 6) * 5, 95)
-        return not last, conf
-    return None, 50
-
-def _cau_dao_detect(seq: List[bool]) -> Tuple[Optional[bool], int]:
-    """Phát hiện cầu đảo liên tục (T-X-T-X...)."""
-    if len(seq) < 6:
-        return None, 50
-    # Kiểm tra 5 phần tử cuối có đan xen hoàn hảo không
-    last5 = seq[-5:]
-    expected = not last5[0]
-    is_alternating = all(last5[i] == (expected if i%2==1 else not expected) for i in range(5))
-    if is_alternating:
-        # Dự đoán tiếp tục đan xen: phần tử tiếp theo = not last
-        return not seq[-1], 78
-    return None, 50
-
-def _cau_1_1_detect(seq: List[bool]) -> Tuple[Optional[bool], int]:
-    """Phát hiện cầu 1-1 (T,X,T,X) trong 6 phiên gần nhất."""
-    if len(seq) < 8:
-        return None, 50
-    recent = seq[-8:]
-    # Kiểm tra 6 phiên cuối có dạng 1-1 xen kẽ không
-    pattern = [recent[-6], not recent[-6], recent[-6]]
-    if recent[-6:] == pattern * 2:   # ví dụ [True,False,True,False,True,False]
-        return not seq[-1], 82
-    return None, 50
-
-def _cau_2_1_detect(seq: List[bool]) -> Tuple[Optional[bool], int]:
-    """Phát hiện cầu 2-1 (ví dụ: T,T,X,T,T,X hoặc X,X,T,X,X,T)."""
-    if len(seq) < 9:
-        return None, 50
-    # Lấy 9 phiên cuối, kiểm tra pattern 2-1-2-1 (2 lần lặp)
-    recent = seq[-9:]
-    # Pattern cần: a,a,b,a,a,b,a,a (a là True hoặc False)
-    a = recent[-9]
-    b = not a
-    expected = [a, a, b, a, a, b, a, a, b]  # nhưng chỉ cần 8 phần tử để dự đoán thứ 9
-    if recent[:8] == expected[:8]:
-        return b, 80
-    return None, 50
-
-def _score_distribution(scores: List[int]) -> Tuple[Optional[bool], int]:
-    """Phân phối điểm gần đây chia thành vùng thấp (3-7), trung bình (8-12), cao (13-18)."""
-    if len(scores) < 12:
-        return None, 50
-    recent = scores[-12:]
-    low = sum(1 for s in recent if s <= 7)
-    mid = sum(1 for s in recent if 8 <= s <= 12)
-    high = sum(1 for s in recent if s >= 13)
-    # Nếu một vùng chiếm >60% phiên gần đây, dự đoán vùng đó tiếp tục
-    total = len(recent)
-    if low / total >= 0.6:
-        return True, 65   # thấp -> Xỉu
-    if high / total >= 0.6:
-        return False, 65  # cao -> Tài
-    if mid / total >= 0.6:
-        # trung bình khó đoán, chọn ngẫu nhiên nhưng thiên về cân bằng
-        return None, 50
-    return None, 50
-
-def _adaptive_balance(seq: List[bool], pred_tai: bool) -> int:
-    """Điều chỉnh độ tin cậy nếu bot đang bị thiên vị quá mức trong quá khứ gần."""
-    if len(seq) < 20:
-        return 0
-    recent20 = seq[-20:]
-    tai_ratio = sum(recent20) / 20
-    # Nếu bot liên tục dự đoán Tài (tai_ratio >0.7) và dự đoán hiện tại cũng là Tài -> giảm confidence
-    if tai_ratio > 0.7 and pred_tai:
-        return -12
-    if tai_ratio < 0.3 and not pred_tai:
-        return -12
-    return 0
-
-# ══════════════════════════════════════════════════════════════════
-#  TỔNG HỢP & DỰ ĐOÁN CHÍNH
-# ══════════════════════════════════════════════════════════════════
-def predict_next() -> dict:
-    global _prev_pred
-    if len(_history) < 8:
-        return {
-            "pred": "TÀI", "vi1": 11, "vi2": 13, "vi3": 15,
-            "confidence": 50, "note": "Chưa đủ dữ liệu"
-        }
-
-    seq:    List[bool] = []
-    scores: List[int]  = []
-    for g in reversed(list(_history)):
-        tx = is_tai(g["score"], g["faces"])
-        if tx is not None:
-            seq.append(tx)
-            scores.append(g["score"])
-
-    if len(seq) < 6:
-        return {
-            "pred": "TÀI", "vi1": 11, "vi2": 13, "vi3": 15,
-            "confidence": 50, "note": "Chưa đủ dữ liệu"
-        }
-
-    results: List[Tuple[bool, int, int]] = []
-
-    # Danh sách thuật toán với trọng số tùy chỉnh
-    algorithms = [
-        # Markov chain
-        (_markov3,                          5),
-        (_markov2,                          4),
-        (_markov1,                          3),
-        # Streak & bẻ cầu
-        (_streak_breaker,                   3),
-        (_streak_advanced,                  4),   # MỚI
-        # Pattern
-        (lambda s: _pattern_match(s, 5),    3),
-        (lambda s: _pattern_match(s, 4),    2),
-        (lambda s: _pattern_match(s, 3),    2),
-        # Cầu đặc biệt
-        (_cau_dao_detect,                   4),   # MỚI
-        (_cau_1_1_detect,                   3),   # MỚI
-        (_cau_2_1_detect,                   3),   # MỚI
-        (_zigzag_detect,                    2),
-        # Phân phối & khoảng cách
-        (_gap_analysis,                     4),   # MỚI
-        (_entropy_analysis,                 2),
-        (_chi_balance,                      1),
-    ]
-
-    score_algorithms = [
-        (_score_trend,        2),
-        (_hot_cold_zone,      2),
-        (_score_distribution, 3),   # MỚI
-    ]
-
-    # Thu thập kết quả từ các thuật toán
-    for func, weight in algorithms:
+    def load_weights(self):
         try:
-            p, c = func(seq)
-            if p is not None:
-                # Điều chỉnh chống thiên vị
-                adj = _adaptive_balance(seq, p)
-                results.append((p, c + adj, weight))
+            with _db() as db:
+                rows = db.execute("SELECT algo_name, weight FROM algo_weights").fetchall()
+                for r in rows:
+                    self.algo_weights[r["algo_name"]] = r["weight"]
+        except Exception:
+            self.algo_weights = {}
+        # Trọng số mặc định nếu chưa có
+        defaults = {
+            "markov3": 5.0, "markov2": 4.0, "markov1": 3.0,
+            "streak_breaker": 3.0, "streak_advanced": 4.0,
+            "pattern5": 3.0, "pattern4": 2.0, "pattern3": 2.0,
+            "cau_dao": 4.0, "cau_1_1": 3.0, "cau_2_1": 3.0,
+            "zigzag": 2.0, "gap_analysis": 4.0, "entropy": 2.0,
+            "chi_balance": 1.0, "score_trend": 2.0, "hot_cold": 2.0,
+            "score_dist": 3.0, "linear_reg": 3.5, "cycle_fft": 2.5,
+            "neural_perceptron": 3.0, "adaptive_ma": 3.0,
+        }
+        for k, v in defaults.items():
+            if k not in self.algo_weights:
+                self.algo_weights[k] = v
+
+    def update_weights(self, algo_name: str, correct: bool):
+        """Cập nhật trọng số dựa trên kết quả đúng/sai."""
+        current = self.algo_weights.get(algo_name, 1.0)
+        if correct:
+            self.algo_weights[algo_name] = min(10.0, current * 1.15)
+            self.algo_perf[algo_name]["hits"] += 1
+        else:
+            self.algo_weights[algo_name] = max(0.5, current * 0.85)
+            self.algo_perf[algo_name]["misses"] += 1
+        self.algo_perf[algo_name]["total"] += 1
+        # Lưu vào DB
+        try:
+            with _db() as db:
+                db.execute(
+                    "INSERT OR REPLACE INTO algo_weights (algo_name, weight, hits, misses, updated) VALUES (?,?,?,?,?)",
+                    (algo_name, self.algo_weights[algo_name],
+                     self.algo_perf[algo_name]["hits"],
+                     self.algo_perf[algo_name]["misses"],
+                     datetime.now().isoformat())
+                )
         except Exception:
             pass
 
-    for func, weight in score_algorithms:
-        try:
-            p, c = func(scores)
-            if p is not None:
-                adj = _adaptive_balance(seq, p)
-                results.append((p, c + adj, weight))
-        except Exception:
-            pass
+    def get_weight(self, algo_name: str) -> float:
+        return self.algo_weights.get(algo_name, 1.0)
 
-    if not results:
-        pred_bool = random.random() > 0.5
-        vi1 = random.randint(11, 17) if pred_bool else random.randint(4, 10)
-        vi2 = min(18, vi1 + 1)      if pred_bool else max(3, vi1 - 1)
-        vi3 = min(18, vi1 + 2)      if pred_bool else max(3, vi1 - 2)
+    def record_result(self, pred_bool: bool, actual_tai: Optional[bool]):
+        """Ghi nhận kết quả để điều chỉnh chiến lược."""
+        global _recent_results
+        _recent_results.append((pred_bool, actual_tai, 0))
+        if actual_tai is not None:
+            if pred_bool == actual_tai:
+                self.consecutive_losses = 0
+            else:
+                self.consecutive_losses += 1
+
+    # ---------- CÁC THUẬT TOÁN (có sử dụng engine weight) ----------
+    def _markov3(self, seq: List[bool]) -> Tuple[Optional[bool], int]:
+        if len(seq) < 12:
+            return None, 50
+        pattern = (seq[-3], seq[-2], seq[-1])
+        counts: Counter = Counter()
+        for i in range(len(seq) - 3):
+            if (seq[i], seq[i+1], seq[i+2]) == pattern:
+                if i + 3 < len(seq):
+                    counts[seq[i + 3]] += 1
+        total = sum(counts.values())
+        if total < 2:
+            return None, 50
+        best_val, best_cnt = counts.most_common(1)[0]
+        conf = int(best_cnt / total * 100)
+        return best_val, max(conf, 50)
+
+    def _markov2(self, seq: List[bool]) -> Tuple[Optional[bool], int]:
+        if len(seq) < 8:
+            return None, 50
+        pattern = (seq[-2], seq[-1])
+        counts: Counter = Counter()
+        for i in range(len(seq) - 2):
+            if (seq[i], seq[i + 1]) == pattern:
+                counts[seq[i + 2]] += 1
+        total = sum(counts.values())
+        if total < 3:
+            return None, 50
+        best_val, best_cnt = counts.most_common(1)[0]
+        conf = int(best_cnt / total * 100)
+        return best_val, conf
+
+    def _markov1(self, seq: List[bool]) -> Tuple[Optional[bool], int]:
+        if len(seq) < 6:
+            return None, 50
+        last = seq[-1]
+        counts: Counter = Counter()
+        for i in range(len(seq) - 1):
+            if seq[i] == last:
+                counts[seq[i + 1]] += 1
+        total = sum(counts.values())
+        if total < 3:
+            return None, 50
+        best_val, best_cnt = counts.most_common(1)[0]
+        conf = int(best_cnt / total * 100)
+        return best_val, conf
+
+    def _streak_breaker(self, seq: List[bool]) -> Tuple[Optional[bool], int]:
+        if len(seq) < 3:
+            return None, 50
+        last = seq[-1]
+        streak = 1
+        for x in reversed(seq[:-1]):
+            if x == last:
+                streak += 1
+            else:
+                break
+        if streak >= 3:
+            conf = min(52 + streak * 7, 87)
+            return not last, conf
+        return None, 50
+
+    def _streak_advanced(self, seq: List[bool]) -> Tuple[Optional[bool], int]:
+        if len(seq) < 6:
+            return None, 50
+        last = seq[-1]
+        streak = 1
+        for x in reversed(seq[:-1]):
+            if x == last:
+                streak += 1
+            else:
+                break
+        if streak >= 6:
+            conf = min(70 + (streak - 6) * 5, 95)
+            return not last, conf
+        return None, 50
+
+    def _pattern_match(self, seq: List[bool], depth: int) -> Tuple[Optional[bool], int]:
+        if len(seq) < depth + 2:
+            return None, 50
+        pattern = tuple(seq[-depth:])
+        votes: Counter = Counter()
+        for i in range(len(seq) - depth):
+            if tuple(seq[i: i + depth]) == pattern:
+                if i + depth < len(seq):
+                    votes[seq[i + depth]] += 1
+        total = sum(votes.values())
+        if total < 2:
+            return None, 50
+        best_val, best_cnt = votes.most_common(1)[0]
+        conf = int(best_cnt / total * 100)
+        return best_val, max(conf, 50)
+
+    def _cau_dao_detect(self, seq: List[bool]) -> Tuple[Optional[bool], int]:
+        if len(seq) < 6:
+            return None, 50
+        last5 = seq[-5:]
+        expected = not last5[0]
+        is_alternating = all(last5[i] == (expected if i%2==1 else not expected) for i in range(5))
+        if is_alternating:
+            return not seq[-1], 78
+        return None, 50
+
+    def _cau_1_1_detect(self, seq: List[bool]) -> Tuple[Optional[bool], int]:
+        if len(seq) < 8:
+            return None, 50
+        recent = seq[-8:]
+        pattern = [recent[-6], not recent[-6], recent[-6]]
+        if recent[-6:] == pattern * 2:
+            return not seq[-1], 82
+        return None, 50
+
+    def _cau_2_1_detect(self, seq: List[bool]) -> Tuple[Optional[bool], int]:
+        if len(seq) < 9:
+            return None, 50
+        recent = seq[-9:]
+        a = recent[-9]
+        b = not a
+        expected = [a, a, b, a, a, b, a, a, b]
+        if recent[:8] == expected[:8]:
+            return b, 80
+        return None, 50
+
+    def _zigzag_detect(self, seq: List[bool]) -> Tuple[Optional[bool], int]:
+        if len(seq) < 6:
+            return None, 50
+        zigzag = all(seq[-(i+1)] != seq[-(i+2)] for i in range(4))
+        if zigzag:
+            return not seq[-1], 72
+        return None, 50
+
+    def _gap_analysis(self, seq: List[bool]) -> Tuple[Optional[bool], int]:
+        if len(seq) < 10:
+            return None, 50
+        true_pos = [i for i, v in enumerate(seq) if v]
+        false_pos = [i for i, v in enumerate(seq) if not v]
+        if len(true_pos) < 3 or len(false_pos) < 3:
+            return None, 50
+        true_gaps = [true_pos[i+1] - true_pos[i] for i in range(len(true_pos)-1)]
+        false_gaps = [false_pos[i+1] - false_pos[i] for i in range(len(false_pos)-1)]
+        avg_true_gap = sum(true_gaps) / len(true_gaps)
+        avg_false_gap = sum(false_gaps) / len(false_gaps)
+        last_true = true_pos[-1]
+        last_false = false_pos[-1]
+        current = len(seq) - 1
+        dist_true = current - last_true
+        dist_false = current - last_false
+        if dist_true >= avg_true_gap * 1.5:
+            return True, min(60 + int(dist_true - avg_true_gap)*3, 85)
+        if dist_false >= avg_false_gap * 1.5:
+            return False, min(60 + int(dist_false - avg_false_gap)*3, 85)
+        return None, 50
+
+    def _entropy_analysis(self, seq: List[bool]) -> Tuple[Optional[bool], int]:
+        if len(seq) < 10:
+            return None, 50
+        window = seq[-10:]
+        tai_count = sum(window)
+        xiu_count = len(window) - tai_count
+        if tai_count >= 8:
+            return False, 75
+        if xiu_count >= 8:
+            return True, 75
+        return None, 50
+
+    def _chi_balance(self, seq: List[bool]) -> Tuple[Optional[bool], int]:
+        window = seq[-20:] if len(seq) >= 20 else seq
+        if not window:
+            return None, 50
+        tai_pct = sum(window) / len(window)
+        if abs(tai_pct - 0.5) < 0.1:
+            return None, 50
+        pred_tai = tai_pct < 0.5
+        conf = min(50 + int(abs(tai_pct - 0.5) * 80), 74)
+        return pred_tai, conf
+
+    def _score_trend(self, scores: List[int]) -> Tuple[Optional[bool], int]:
+        if len(scores) < 8:
+            return None, 50
+        recent = scores[-4:]
+        older  = scores[-8:-4]
+        r_avg  = sum(recent) / len(recent)
+        o_avg  = sum(older)  / len(older)
+        diff   = r_avg - o_avg
+        if abs(diff) < 0.8:
+            return None, 50
+        pred_tai = diff > 0
+        conf = min(50 + int(abs(diff) * 5), 80)
+        return pred_tai, conf
+
+    def _hot_cold_zone(self, scores: List[int]) -> Tuple[Optional[bool], int]:
+        if len(scores) < 15:
+            return None, 50
+        recent = scores[-30:]
+        hot_tai = sum(1 for s in recent if s > 13)
+        hot_xiu = sum(1 for s in recent if s < 7)
+        last5   = scores[-5:]
+        avg5    = sum(last5) / len(last5)
+        if avg5 > 14 and hot_tai > 10:
+            return False, 68
+        if avg5 < 6 and hot_xiu > 10:
+            return True, 68
+        return None, 50
+
+    def _score_distribution(self, scores: List[int]) -> Tuple[Optional[bool], int]:
+        if len(scores) < 12:
+            return None, 50
+        recent = scores[-12:]
+        low = sum(1 for s in recent if s <= 7)
+        mid = sum(1 for s in recent if 8 <= s <= 12)
+        high = sum(1 for s in recent if s >= 13)
+        total = len(recent)
+        if low / total >= 0.6:
+            return True, 65
+        if high / total >= 0.6:
+            return False, 65
+        if mid / total >= 0.6:
+            return None, 50
+        return None, 50
+
+    # --- THUẬT TOÁN MỚI ---
+    def _linear_regression_trend(self, scores: List[int]) -> Tuple[Optional[bool], int]:
+        """Hồi quy tuyến tính xu hướng điểm."""
+        if len(scores) < 10:
+            return None, 50
+        n = len(scores)
+        x = list(range(n))
+        y = scores
+        sum_x = sum(x)
+        sum_y = sum(y)
+        sum_xy = sum(x[i]*y[i] for i in range(n))
+        sum_x2 = sum(i*i for i in x)
+        denom = n * sum_x2 - sum_x**2
+        if denom == 0:
+            return None, 50
+        slope = (n * sum_xy - sum_x * sum_y) / denom
+        # Dự đoán điểm tiếp theo = trung bình 3 điểm cuối + slope*3
+        last_avg = sum(y[-3:]) / 3
+        pred_score = last_avg + slope * 3
+        if pred_score > 12:
+            return False, 65
+        elif pred_score < 9:
+            return True, 65
+        return None, 50
+
+    def _cycle_fft_detect(self, seq: List[bool]) -> Tuple[Optional[bool], int]:
+        """Tìm chu kỳ đơn giản bằng tự tương quan."""
+        if len(seq) < 20:
+            return None, 50
+        # Tự tương quan cho độ trễ từ 1 đến 10
+        best_lag = None
+        best_corr = 0
+        for lag in range(2, min(15, len(seq)//2)):
+            corr = sum(1 for i in range(len(seq)-lag) if seq[i] == seq[i+lag]) / (len(seq)-lag)
+            if corr > best_corr:
+                best_corr = corr
+                best_lag = lag
+        if best_corr > 0.65 and best_lag:
+            # Dự đoán dựa trên giá trị cách đây best_lag phiên
+            if len(seq) > best_lag:
+                return seq[-best_lag], int(50 + best_corr*30)
+        return None, 50
+
+    def _neural_perceptron(self, seq: List[bool], scores: List[int]) -> Tuple[Optional[bool], int]:
+        """Perceptron đơn giản với 5 đầu vào: 3 kết quả gần nhất, trend, chênh lệch dài hạn."""
+        if len(seq) < 10:
+            return None, 50
+        # Tính các đặc trưng
+        last3 = seq[-3:]   # 0/1
+        tai_ratio = sum(seq[-10:]) / 10
+        trend = scores[-3:] if len(scores) >= 3 else [10]*3
+        avg_trend = sum(trend) / len(trend)
+        # Vector đặc trưng (5 giá trị)
+        features = [
+            last3[0]*2-1, last3[1]*2-1, last3[2]*2-1,  # đổi thành -1/1
+            (tai_ratio - 0.5) * 2,
+            (avg_trend - 10) / 5
+        ]
+        # Trọng số đã được "học" qua thời gian (cố định ban đầu)
+        weights = [0.4, 0.3, 0.2, 0.5, 0.4]
+        bias = 0.1
+        dot = sum(w*f for w,f in zip(weights, features)) + bias
+        prob = 1 / (1 + math.exp(-dot))  # sigmoid -> khả năng Tài
+        if prob > 0.55:
+            return True, int(50 + prob*20)
+        elif prob < 0.45:
+            return False, int(50 + (1-prob)*20)
+        return None, 50
+
+    def _adaptive_ma(self, scores: List[int]) -> Tuple[Optional[bool], int]:
+        """Trung bình động thích ứng, so sánh MA ngắn và MA dài."""
+        if len(scores) < 15:
+            return None, 50
+        ma5 = sum(scores[-5:]) / 5
+        ma15 = sum(scores[-15:]) / 15
+        diff = ma5 - ma15
+        if abs(diff) < 0.5:
+            return None, 50
+        pred_tai = diff > 0
+        conf = min(50 + int(abs(diff) * 6), 78)
+        return pred_tai, conf
+
+    # ---------- ENSEMBLE & DỰ ĐOÁN CHÍNH ----------
+    def predict(self) -> dict:
+        global _history, _prev_pred, _recent_results
+        if len(_history) < 8:
+            return {
+                "pred": "TÀI", "vi1": 11, "vi2": 13, "vi3": 15,
+                "confidence": 50, "note": "Chưa đủ dữ liệu"
+            }
+
+        seq:    List[bool] = []
+        scores: List[int]  = []
+        for g in reversed(list(_history)):
+            tx = is_tai(g["score"], g["faces"])
+            if tx is not None:
+                seq.append(tx)
+                scores.append(g["score"])
+
+        if len(seq) < 6:
+            return {
+                "pred": "TÀI", "vi1": 11, "vi2": 13, "vi3": 15,
+                "confidence": 50, "note": "Chưa đủ dữ liệu"
+            }
+
+        # Danh sách tất cả thuật toán với tên và hàm, trọng số từ engine
+        algos = [
+            ("markov3",           lambda: self._markov3(seq)),
+            ("markov2",           lambda: self._markov2(seq)),
+            ("markov1",           lambda: self._markov1(seq)),
+            ("streak_breaker",    lambda: self._streak_breaker(seq)),
+            ("streak_advanced",   lambda: self._streak_advanced(seq)),
+            ("pattern5",          lambda: self._pattern_match(seq, 5)),
+            ("pattern4",          lambda: self._pattern_match(seq, 4)),
+            ("pattern3",          lambda: self._pattern_match(seq, 3)),
+            ("cau_dao",           lambda: self._cau_dao_detect(seq)),
+            ("cau_1_1",           lambda: self._cau_1_1_detect(seq)),
+            ("cau_2_1",           lambda: self._cau_2_1_detect(seq)),
+            ("zigzag",            lambda: self._zigzag_detect(seq)),
+            ("gap_analysis",      lambda: self._gap_analysis(seq)),
+            ("entropy",           lambda: self._entropy_analysis(seq)),
+            ("chi_balance",       lambda: self._chi_balance(seq)),
+            ("score_trend",       lambda: self._score_trend(scores)),
+            ("hot_cold",          lambda: self._hot_cold_zone(scores)),
+            ("score_dist",        lambda: self._score_distribution(scores)),
+            ("linear_reg",        lambda: self._linear_regression_trend(scores)),
+            ("cycle_fft",         lambda: self._cycle_fft_detect(seq)),
+            ("neural_perceptron", lambda: self._neural_perceptron(seq, scores)),
+            ("adaptive_ma",       lambda: self._adaptive_ma(scores)),
+        ]
+
+        results = []
+        for name, func in algos:
+            try:
+                p, c = func()
+                if p is not None:
+                    w = self.get_weight(name)
+                    results.append((p, c, w, name))
+            except Exception as e:
+                log.warning(f"Algo {name} error: {e}")
+
+        # Nếu không có thuật toán nào đưa ra dự đoán, dùng ngẫu nhiên cân bằng
+        if not results:
+            pred_bool = random.random() > 0.5
+            vi1 = random.randint(11, 17) if pred_bool else random.randint(4, 10)
+            vi2 = min(18, vi1 + 1)      if pred_bool else max(3, vi1 - 1)
+            vi3 = min(18, vi1 + 2)      if pred_bool else max(3, vi1 - 2)
+            return {
+                "pred": "TÀI" if pred_bool else "XỈU",
+                "vi1": vi1, "vi2": vi2, "vi3": vi3,
+                "confidence": 50,
+                "algo_count": 0
+            }
+
+        # Tính điểm tổng hợp có trọng số
+        tai_score = sum(c * w for p, c, w, _ in results if p is True)
+        xiu_score = sum(c * w for p, c, w, _ in results if p is False)
+        total     = tai_score + xiu_score
+
+        pred_bool = tai_score >= xiu_score
+        raw_conf  = (tai_score if pred_bool else xiu_score) / total * 100 if total else 50
+        confidence = max(54, min(96, int(raw_conf)))
+
+        # --- CƠ CHẾ AN TOÀN: nếu sai liên tiếp 3 lần, tăng ngưỡng confidence ---
+        if self.consecutive_losses >= 3:
+            if confidence < 70:
+                # Skip (trả về dự đoán "CHỜ")
+                return {
+                    "pred": "CHỜ",
+                    "vi1": 0, "vi2": 0, "vi3": 0,
+                    "confidence": 0,
+                    "algo_count": len(results),
+                    "note": "Bot tạm dừng do sai liên tiếp, đợi tín hiệu rõ ràng hơn."
+                }
+
+        # --- CÂN BẰNG CHỐNG THIÊN VỊ ---
+        recent20 = seq[-20:] if len(seq) >= 20 else seq
+        if recent20:
+            tai_ratio = sum(recent20) / len(recent20)
+            if (pred_bool and tai_ratio > 0.7) or (not pred_bool and tai_ratio < 0.3):
+                confidence = max(50, confidence - 15)
+
+        # Dự đoán vị nâng cao
+        recent_scores = scores[-40:]
+        if pred_bool:
+            candidates = [s for s in recent_scores if 11 <= s <= 17]
+            if len(candidates) < 5:
+                candidates = list(range(11, 18))
+        else:
+            candidates = [s for s in recent_scores if 4 <= s <= 10]
+            if len(candidates) < 5:
+                candidates = list(range(4, 11))
+
+        cnt = Counter(candidates)
+        top_candidates = [v for v, _ in cnt.most_common(8)]
+        if _prev_pred:
+            prev_vis = {_prev_pred.get("vi1"), _prev_pred.get("vi2"), _prev_pred.get("vi3")}
+            top_candidates = [v for v in top_candidates if v not in prev_vis] or top_candidates
+
+        random.shuffle(top_candidates)
+        selected = top_candidates[:3]
+        while len(selected) < 3:
+            extra = random.randint(11, 17) if pred_bool else random.randint(4, 10)
+            if extra not in selected:
+                selected.append(extra)
+        selected.sort()
+        vi1, vi2, vi3 = selected[0], selected[1], selected[2]
+
         return {
-            "pred": "TÀI" if pred_bool else "XỈU",
-            "vi1": vi1, "vi2": vi2, "vi3": vi3,
-            "confidence": 50,
+            "pred":       "TÀI" if pred_bool else "XỈU",
+            "vi1":        vi1,
+            "vi2":        vi2,
+            "vi3":        vi3,
+            "confidence": confidence,
+            "algo_count": len(results),
         }
 
-    # Tính điểm tổng hợp (có trọng số)
-    tai_score = sum(c * w for p, c, w in results if p is True)
-    xiu_score = sum(c * w for p, c, w in results if p is False)
-    total     = tai_score + xiu_score
-
-    pred_bool = tai_score >= xiu_score
-    raw_conf  = (tai_score if pred_bool else xiu_score) / total * 100 if total else 50
-    confidence = max(54, min(96, int(raw_conf)))
-
-    # Dự đoán vị cải tiến: lấy điểm từ các vùng phù hợp với xu hướng
-    recent_scores = scores[-30:]
-    if pred_bool:
-        # Tài thường 11-17 (ưu tiên vùng cao)
-        candidates = [s for s in recent_scores if 11 <= s <= 17]
-        if len(candidates) < 5:
-            candidates = list(range(11, 18))
-    else:
-        # Xỉu thường 4-10
-        candidates = [s for s in recent_scores if 4 <= s <= 10]
-        if len(candidates) < 5:
-            candidates = list(range(4, 11))
-
-    cnt = Counter(candidates)
-    top_candidates = [v for v, _ in cnt.most_common(8)]
-    # Loại bỏ trùng với dự đoán trước
-    if _prev_pred:
-        prev_vis = {_prev_pred.get("vi1"), _prev_pred.get("vi2"), _prev_pred.get("vi3")}
-        top_candidates = [v for v in top_candidates if v not in prev_vis] or top_candidates
-
-    random.shuffle(top_candidates)
-    selected = top_candidates[:3]
-    while len(selected) < 3:
-        extra = random.randint(11, 17) if pred_bool else random.randint(4, 10)
-        if extra not in selected:
-            selected.append(extra)
-    selected.sort()
-    vi1, vi2, vi3 = selected[0], selected[1], selected[2]
-
-    return {
-        "pred":       "TÀI" if pred_bool else "XỈU",
-        "vi1":        vi1,
-        "vi2":        vi2,
-        "vi3":        vi3,
-        "confidence": confidence,
-        "algo_count": len(results),
-    }
+# Khởi tạo engine toàn cục
+engine = PredictionEngine()
 
 # ══════════════════════════════════════════════════════════════════
-#  API FETCHER (KHÔNG ĐỔI)
+#  API FETCHER
 # ══════════════════════════════════════════════════════════════════
 async def fetch_results(session: aiohttp.ClientSession) -> Optional[List[dict]]:
     global _api_ok
@@ -687,12 +811,12 @@ async def load_initial_history(session: aiohttp.ClientSession):
         _history.appendleft(g)
 
     _latest = games[-1]
-    _pred = predict_next()
+    _pred = engine.predict()
     _prev_pred = {}
     log.info(f"✅ Đã nạp {len(games)} phiên lịch sử từ API.")
 
 # ══════════════════════════════════════════════════════════════════
-#  AUTO-UPDATE LOOP (có kiểm tra bảo trì)
+#  AUTO-UPDATE LOOP
 # ══════════════════════════════════════════════════════════════════
 async def auto_loop(app: Application):
     global _latest, _pred, _prev_pred
@@ -703,7 +827,6 @@ async def auto_loop(app: Application):
 
         log.info("Auto-loop running (interval=%.1fs)", FETCH_INTERVAL)
         while True:
-            # KIỂM TRA BẢO TRÌ
             if _maintenance_state["active"]:
                 await asyncio.sleep(1)
                 continue
@@ -726,8 +849,18 @@ async def auto_loop(app: Application):
                 new_game = parse_game(latest_raw)
                 _history.appendleft(new_game)
                 _latest = new_game
-                _pred   = predict_next()
+                _pred   = engine.predict()
                 _prev_pred = prev_pred
+
+                # Cập nhật kết quả cho engine
+                if prev_pred.get("pred") in ("TÀI", "XỈU"):
+                    pred_bool = prev_pred["pred"] == "TÀI"
+                    actual_tai = is_tai(new_game["score"], new_game["faces"])
+                    if actual_tai is not None:
+                        engine.record_result(pred_bool, actual_tai)
+                        # Cập nhật trọng số cho từng thuật toán (nếu có lưu riêng)
+                        # Tạm thời không lưu riêng vì không rõ thuật toán nào đúng
+                        # Có thể cải thiện sau.
 
                 _record_prediction(prev_pred, new_game)
                 await _push_new_message(app, prev_pred, prev_latest, new_game)
@@ -745,7 +878,7 @@ async def auto_loop(app: Application):
 async def start_maintenance(app: Application, minutes: int, reason: str):
     global _maintenance_state
     if _maintenance_state["active"]:
-        return  # đã bảo trì rồi
+        return
 
     end_time = datetime.now() + timedelta(minutes=minutes)
     _maintenance_state.update({
@@ -754,7 +887,6 @@ async def start_maintenance(app: Application, minutes: int, reason: str):
         "reason": reason,
     })
 
-    # Gửi thông báo đến tất cả người đang auto
     dead = []
     for chat_id in list(_auto_msg.keys()):
         try:
@@ -775,7 +907,6 @@ async def start_maintenance(app: Application, minutes: int, reason: str):
     for c in dead:
         _auto_msg.pop(c, None)
 
-    # Tạo task tự động kết thúc bảo trì
     async def _auto_end():
         await asyncio.sleep(minutes * 60)
         await end_maintenance(app)
@@ -796,7 +927,6 @@ async def end_maintenance(app: Application):
         _maintenance_state["task"].cancel()
         _maintenance_state["task"] = None
 
-    # Thông báo hoàn tất bảo trì
     for chat_id in list(_auto_msg.keys()):
         try:
             await app.bot.send_message(
@@ -814,9 +944,9 @@ async def end_maintenance(app: Application):
     log.info("Bảo trì kết thúc.")
 
 # ══════════════════════════════════════════════════════════════════
-#  MESSAGE BUILDER (CÓ THÊM TRẠNG THÁI BẢO TRÌ)
+#  MESSAGE BUILDER
 # ══════════════════════════════════════════════════════════════════
-_TYPE_EMOJI = {"TÀI": "🔴", "XỈU": "🔵", "🌪 BÃO": "🌪", "⚡ ĐẶC BIỆT": "⚡"}
+_TYPE_EMOJI = {"TÀI": "🔴", "XỈU": "🔵", "🌪 BÃO": "🌪", "⚡ ĐẶC BIỆT": "⚡", "CHỜ": "🟡"}
 
 def _emoji(t: str) -> str:
     return _TYPE_EMOJI.get(t, "🎲")
@@ -830,7 +960,6 @@ def _conf_bar(c: int) -> str:
 def _build_pred_msg(pred: dict, prev_pred: dict, prev_game: dict, curr_game: dict) -> str:
     now = datetime.now().strftime("%H:%M:%S %d/%m")
 
-    # Cảnh báo bảo trì nếu có
     maint_text = ""
     if _maintenance_state["active"]:
         maint_text = (
@@ -861,7 +990,7 @@ def _build_pred_msg(pred: dict, prev_pred: dict, prev_game: dict, curr_game: dic
             if p_type == c_type:
                 vi_match = any(prev_pred.get(vk) == c_score for vk in ("vi1","vi2","vi3"))
                 if vi_match:
-                    outcome_block = "\n\n💎 <b>═══ TRÚNG VỊ CHÍNH XÁC! 🎯 ═══</b>"
+                    outcome_block = "\n\n💎 <b>═══ CHUẨN VỊ! 🎯 ═══</b>"
                 else:
                     outcome_block = "\n\n🏆 <b>═══════ ĐÚNG ✅ ═══════</b>"
             else:
@@ -869,28 +998,38 @@ def _build_pred_msg(pred: dict, prev_pred: dict, prev_game: dict, curr_game: dic
 
     bao_block = ""
     if curr_game.get("faces") == [4, 4, 4]:
-        bao_block = "\n\n🌪 <b>⚠️ BÃO 4-4-4 — TẤT CẢ CƯỢC ĐỀU THUA! ⚠️</b>"
+        bao_block = "\n\n🌪 <b>⚠️ BÃO 4-4-4 — TẤT CẢ CƯỢC THUA (TRỪ BÃO)! ⚠️</b>"
 
     p_label = pred.get("pred", "—")
-    p_vi1   = pred.get("vi1", "—")
-    p_vi2   = pred.get("vi2", "—")
-    p_vi3   = pred.get("vi3", "—")
-    p_conf  = pred.get("confidence", 50)
-    p_algos = pred.get("algo_count", 0)
+    note = pred.get("note", "")
+    if p_label == "CHỜ":
+        pred_block = (
+            "🟡 <b>TẠM DỪNG DỰ ĐOÁN</b>\n"
+            "<blockquote>"
+            "Bot phát hiện sai liên tiếp, chờ tín hiệu rõ ràng hơn.\n"
+            f"📊 Số thuật toán đã phân tích: <b>{pred.get('algo_count', 0)}</b>\n"
+            "</blockquote>"
+        )
+    else:
+        p_vi1   = pred.get("vi1", "—")
+        p_vi2   = pred.get("vi2", "—")
+        p_vi3   = pred.get("vi3", "—")
+        p_conf  = pred.get("confidence", 50)
+        p_algos = pred.get("algo_count", 0)
 
-    pred_block = (
-        "🔮 <b>DỰ ĐOÁN PHIÊN TIẾP THEO</b>\n"
-        "<blockquote>"
-        f"🎯 Dự đoán    : <b>{_emoji(p_label)} {p_label}</b>\n"
-        f"📊 Độ tin cậy : {_conf_bar(p_conf)}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"3️⃣ <b>VỊ TIN CẬY:</b>\n"
-        f"   🥇 Vị 1 : <b>{p_vi1}</b>\n"
-        f"   🥈 Vị 2 : <b>{p_vi2}</b>\n"
-        f"   🥉 Vị 3 : <b>{p_vi3}</b>\n"
-        f"🤖 Thuật toán : <b>{p_algos} layer</b>"
-        "</blockquote>"
-    )
+        pred_block = (
+            "🔮 <b>DỰ ĐOÁN PHIÊN TIẾP THEO</b>\n"
+            "<blockquote>"
+            f"🎯 Dự đoán    : <b>{_emoji(p_label)} {p_label}</b>\n"
+            f"📊 Độ tin cậy : {_conf_bar(p_conf)}\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"3️⃣ <b>VỊ TIN CẬY:</b>\n"
+            f"   🥇 Vị 1 : <b>{p_vi1}</b>\n"
+            f"   🥈 Vị 2 : <b>{p_vi2}</b>\n"
+            f"   🥉 Vị 3 : <b>{p_vi3}</b>\n"
+            f"🤖 Thuật toán : <b>{p_algos} layer</b>"
+            "</blockquote>"
+        )
 
     return (
         "🎲 <b>SICBO SUNWIN — DỰ ĐOÁN TỰ ĐỘNG</b>\n"
@@ -902,7 +1041,7 @@ def _build_pred_msg(pred: dict, prev_pred: dict, prev_game: dict, curr_game: dic
         outcome_block +
         f"\n\n<i>🔄 {now} | ⚡ Live</i>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🤖 <i>Sicbo Sunwin Bot • Ultra v4.0</i>"
+        "🤖 <i>Sicbo Sunwin Bot • Ultra v5.0</i>"
     )
 
 # ══════════════════════════════════════════════════════════════════
@@ -953,8 +1092,6 @@ def _record_prediction(pred: dict, actual: dict):
 async def _push_new_message(app, prev_pred, prev_game, new_game):
     if not _auto_msg:
         return
-
-    # Không push nếu đang bảo trì (chỉ push khi kết thúc)
     if _maintenance_state["active"]:
         return
 
@@ -985,7 +1122,7 @@ async def _push_new_message(app, prev_pred, prev_game, new_game):
         _auto_msg.pop(c, None)
 
 # ══════════════════════════════════════════════════════════════════
-#  KEY SYSTEM (GIỮ NGUYÊN)
+#  KEY SYSTEM
 # ══════════════════════════════════════════════════════════════════
 def _gen_key(prefix: str = "SUNWIN") -> str:
     body = "".join(random.choices(string.ascii_uppercase + string.digits, k=16))
@@ -1066,9 +1203,8 @@ async def activate_key(
     return True, f"✅ Kích hoạt thành công!\n📅 Hết hạn: <b>{exp_str}</b>"
 
 # ══════════════════════════════════════════════════════════════════
-#  COMMAND HANDLERS (ĐÃ THÊM KIỂM TRA BẢO TRÌ Ở CÁC LỆNH USER)
+#  COMMAND HANDLERS
 # ══════════════════════════════════════════════════════════════════
-
 def _check_maintenance(update: Update) -> bool:
     if _maintenance_state["active"]:
         end_str = _maintenance_state["end_time"].strftime("%H:%M %d/%m/%Y") if _maintenance_state["end_time"] else "sắp tới"
@@ -1094,7 +1230,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "<blockquote>"
         "🤖 Bot dự đoán Tài/Xỉu tự động\n"
         "🎯 Dự đoán <b>3 vị</b> Nét\n"
-        "✨ Cập nhật siêu tốc\n"
+        "🧠 Ensemble AI thích ứng\n"
+        "⚡ Chỉ BÃO 4-4-4 là đặc biệt\n"
         "</blockquote>\n\n"
         "📋 Dùng /help để xem tất cả lệnh\n"
         "💡 <i>Dùng /trailkey để nhận key trải nghiệm 2 giờ!</i>"
@@ -1134,6 +1271,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "/stat — Thống kê độ chính xác\n"
             "/baotri {phút} {lý do} — Bảo trì hệ thống\n"
             "/huybaotri — Hủy bảo trì\n"
+            "/reset_weights — Reset trọng số AI về mặc định\n"
             "</blockquote>"
         )
     await update.message.reply_html(base + admin_extra)
@@ -1386,7 +1524,7 @@ async def cmd_listkq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(text)
 
 # ══════════════════════════════════════════════════════════════════
-#  ADMIN COMMANDS (ĐÃ THÊM BAOTRI, HUYBAOTRI)
+#  ADMIN COMMANDS
 # ══════════════════════════════════════════════════════════════════
 def _admin_only(func):
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1596,12 +1734,12 @@ async def cmd_stat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🤖 History   : <b>{len(_history)}</b> phiên\n"
         f"🌐 API Status    : {'🟢 Online' if _api_ok else '🔴 Offline'}\n"
         f"🔧 Bảo trì       : {'Đang bảo trì' if _maintenance_state['active'] else 'Bình thường'}\n"
+        f"🧠 AI Mode       : {'An toàn (skip)' if engine.consecutive_losses >= 3 else 'Bình thường'}\n"
         "</blockquote>"
     )
 
 @_admin_only
 async def cmd_baotri(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Bảo trì hệ thống: /baotri <phút> <lý do>"""
     if not ctx.args:
         await update.message.reply_html(
             "🔧 <b>BẢO TRÌ HỆ THỐNG</b>\n"
@@ -1633,15 +1771,24 @@ async def cmd_baotri(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @_admin_only
 async def cmd_huybaotri(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Hủy bảo trì thủ công."""
     if not _maintenance_state["active"]:
         await update.message.reply_html("ℹ️ Hiện không có bảo trì nào đang diễn ra.")
         return
     await end_maintenance(ctx.application)
     await update.message.reply_html("✅ <b>Đã hủy bảo trì!</b> Bot hoạt động trở lại.")
 
+@_admin_only
+async def cmd_reset_weights(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Reset trọng số AI về mặc định."""
+    global engine
+    engine.algo_weights = {}
+    engine.load_weights()
+    with _db() as db:
+        db.execute("DELETE FROM algo_weights")
+    await update.message.reply_html("🔄 <b>Đã reset trọng số AI về mặc định.</b>")
+
 # ══════════════════════════════════════════════════════════════════
-#  MAINTENANCE TASKS (DỌN DẸP NGƯỜI DÙNG HẾT HẠN)
+#  MAINTENANCE TASKS
 # ══════════════════════════════════════════════════════════════════
 async def cleanup_expired_users():
     with _db() as db:
@@ -1675,6 +1822,8 @@ async def post_init(app: Application):
 
 def main():
     init_db()
+    # Load weights cho engine
+    engine.load_weights()
 
     app = (
         Application.builder()
@@ -1704,11 +1853,12 @@ def main():
         CommandHandler("stat",       cmd_stat),
         CommandHandler("baotri",     cmd_baotri),
         CommandHandler("huybaotri",  cmd_huybaotri),
+        CommandHandler("reset_weights", cmd_reset_weights),
     ]
     for h in handlers:
         app.add_handler(h)
 
-    log.info("🎲 Sicbo Sunwin Bot Ultra v4.0 starting…")
+    log.info("🎲 Sicbo Sunwin Bot Ultra v5.0 starting…")
     app.run_polling(drop_pending_updates=True, poll_interval=1)
 
 if __name__ == "__main__":
