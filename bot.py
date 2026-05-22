@@ -1,15 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-SicBo + LC + Betvip Bot Ultra v8.0
-Nâng cấp:
-  - Thuật toán dự đoán mạnh hơn, chuẩn hơn (multi-layer ensemble)
-  - /start gửi kèm GIF chào mừng từ cùng thư mục
-  - Lock/Ulock sửa hoàn toàn, persist DB, 100% hoạt động
-  - Khi sàn đang thông (thắng nhiều) → broadcast đến tất cả user
-  - Code sạch, xử lý tất cả trường hợp ngoại lệ
-"""
-
 import asyncio
 import json
 import logging
@@ -28,32 +16,26 @@ from telegram.constants import ParseMode
 from telegram.error import Forbidden, TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ═══════════════════════════════════════════════════════════════════════
-# CONFIG
-# ═══════════════════════════════════════════════════════════════════════
 BOT_TOKEN  = "8828842195:AAGdzF60aoUbBv6PJf8_LnQ0AunYF3UN8C8"
 ADMIN_IDS  = [8001225219]
 DB_PATH    = "bot_ultra.db"
 MEM_WINDOW = 500
 
-SICBO_INTERVAL   = 2.0
+SICBO_INTERVAL   = 1.9
 LC_INTERVAL      = 0.5
 MAX_RETRIES      = 3
-MIN_CONF_PREDICT = 0.60   # Ngưỡng tối thiểu để ra dự đoán
+MIN_CONF_PREDICT = 0.58
 
-# Hot streak broadcast: khi thắng liên tiếp đạt ngưỡng này sẽ broadcast
 HOT_STREAK_THRESHOLDS = {3, 5, 7, 10, 15}
 
-# GIF chào mừng — đặt file welcome.gif cùng thư mục với bot
 WELCOME_GIF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "welcome.gif")
 
-# ── API endpoints ───────────────────────────────────────────────────────
 SICBO_API = (
     "https://api.wsktnus8.net/v2/history/getLastResult"
     "?gameId=ktrng_3979&size=100&tableId=39791215743193&curPage=1"
 )
-LC_MD5_API   = "https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=07d01d98fd85e91efaa91fe492970412"
-LC_HU_API    = "https://wtx.tele68.com/v1/tx/lite-sessions?cp=R&cl=R&pf=web&at=07d01d98fd85e91efaa91fe492970412"
+LC_MD5_API     = "https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=07d01d98fd85e91efaa91fe492970412"
+LC_HU_API      = "https://wtx.tele68.com/v1/tx/lite-sessions?cp=R&cl=R&pf=web&at=07d01d98fd85e91efaa91fe492970412"
 BETVIP_MD5_API = "https://wtxmd52.macminim6.online/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=4256ce1eed33ffa0e0990d398f1f907f"
 BETVIP_HU_API  = "https://wtx.macminim6.online/v1/tx/sessions?cp=R&cl=R&pf=web&at=4256ce1eed33ffa0e0990d398f1f907f"
 
@@ -75,9 +57,6 @@ _UA_POOL = [
     "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 Chrome/112.0.0.0 Mobile Safari/537.36",
 ]
 
-# ═══════════════════════════════════════════════════════════════════════
-# GAME MODE CONSTANTS
-# ═══════════════════════════════════════════════════════════════════════
 SICBO   = "sicbo"
 LC_MD5  = "lc_md5"
 LC_HU   = "lc_hu"
@@ -96,7 +75,6 @@ GAME_LABELS = {
 
 TX_ONLY_GAMES = {LC_MD5, LC_HU, BET_MD5, BET_HU}
 
-# ── Logging ─────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
@@ -104,16 +82,13 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ═══════════════════════════════════════════════════════════════════════
-# GLOBAL STATE
-# ═══════════════════════════════════════════════════════════════════════
 _states: Dict[str, dict] = {
     gm: {
         "history":     deque(maxlen=MEM_WINDOW),
         "latest":      {},
         "pred":        {},
         "prev_pred":   {},
-        "auto_msg":    {},   # chat_id -> message_id
+        "auto_msg":    {},
         "api_ok":      False,
         "consec_loss": 0,
         "consec_win":  0,
@@ -128,12 +103,9 @@ _maintenance = {
     "task":     None,
 }
 
-# locked commands — persisted to DB
 _locked_cmds: set = set()
 
-# ═══════════════════════════════════════════════════════════════════════
-# DATABASE
-# ═══════════════════════════════════════════════════════════════════════
+
 def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -202,7 +174,6 @@ def init_db():
             );
         """)
 
-    # Restore locked commands từ DB vào bộ nhớ
     with _db() as db:
         rows = db.execute("SELECT cmd FROM locked_cmds").fetchall()
         for r in rows:
@@ -211,9 +182,6 @@ def init_db():
     log.info("Database initialised. Locked cmds: %s", _locked_cmds)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# AUTH
-# ═══════════════════════════════════════════════════════════════════════
 def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
@@ -255,11 +223,7 @@ def get_expiry_str(uid: int) -> str:
     return "Không xác định"
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# LOCK SYSTEM — 100% hoạt động, đồng bộ DB + RAM
-# ═══════════════════════════════════════════════════════════════════════
 def lock_cmd(cmd: str, uid: int, reason: str = ""):
-    """Khóa lệnh — lưu vào RAM và DB ngay lập tức."""
     _locked_cmds.add(cmd)
     try:
         with _db() as db:
@@ -273,7 +237,6 @@ def lock_cmd(cmd: str, uid: int, reason: str = ""):
 
 
 def unlock_cmd(cmd: str):
-    """Mở khóa lệnh — xóa khỏi RAM và DB."""
     _locked_cmds.discard(cmd)
     try:
         with _db() as db:
@@ -284,15 +247,13 @@ def unlock_cmd(cmd: str):
 
 
 def is_locked(cmd: str) -> bool:
-    """Kiểm tra RAM trước, DB là backup."""
     if cmd in _locked_cmds:
         return True
-    # Double-check DB phòng trường hợp RAM mất sync
     try:
         with _db() as db:
             row = db.execute("SELECT 1 FROM locked_cmds WHERE cmd=?", (cmd,)).fetchone()
             if row:
-                _locked_cmds.add(cmd)   # sync lại RAM
+                _locked_cmds.add(cmd)
                 return True
     except Exception:
         pass
@@ -308,9 +269,6 @@ def get_lock_reason(cmd: str) -> str:
         return "Bảo trì"
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# GAME LOGIC
-# ═══════════════════════════════════════════════════════════════════════
 def classify_game(score: int, faces: list, game_mode: str) -> str:
     sf = sorted(faces)
     if game_mode == SICBO:
@@ -336,11 +294,7 @@ def is_tai(score: int, faces: list, game_mode: str) -> Optional[bool]:
     return None
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# PREDICTION ENGINE v2 — Siêu mạnh, đa tầng, adaptive
-# ═══════════════════════════════════════════════════════════════════════
 class CauDetector:
-    """Nhận diện loại cầu từ chuỗi lịch sử với độ chính xác cao."""
 
     @staticmethod
     def streak(seq: List[bool]) -> Tuple[int, bool]:
@@ -364,124 +318,172 @@ class CauDetector:
 
         sk, last_val = CauDetector.streak(seq)
 
-        # ── Bệt siêu dài (≥12): rất dễ gãy
-        if sk >= 12:
+        if sk >= 14:
             return {"type": "BỆT SIÊU DÀI", "len": sk, "pred": not last_val,
-                    "conf": min(92 + (sk - 12), 97),
-                    "desc": f"Bệt {'Tài' if last_val else 'Xỉu'} {sk} ván ⚠️ Nguy cơ gãy cực cao",
-                    "break_risk": 95}
-        # ── Bệt dài (7-11)
-        if sk >= 7:
+                    "conf": min(95 + (sk - 14), 99),
+                    "desc": f"Bệt {'Tài' if last_val else 'Xỉu'} {sk} ván ⚠️ Gãy cực cao",
+                    "break_risk": 97}
+
+        if sk >= 10:
             return {"type": "BỆT DÀI", "len": sk, "pred": not last_val,
-                    "conf": min(78 + (sk - 7) * 3, 91),
+                    "conf": min(88 + (sk - 10) * 2, 94),
                     "desc": f"Bệt {'Tài' if last_val else 'Xỉu'} {sk} ván — Rất dễ gãy",
-                    "break_risk": 80}
-        # ── Bệt vừa (5-6)
+                    "break_risk": 88}
+
+        if sk >= 7:
+            return {"type": "BỆT DÀI VỪA", "len": sk, "pred": not last_val,
+                    "conf": min(78 + (sk - 7) * 3, 87),
+                    "desc": f"Bệt {'Tài' if last_val else 'Xỉu'} {sk} ván — Dễ gãy",
+                    "break_risk": 75}
+
         if sk >= 5:
             return {"type": "BỆT VỪA", "len": sk, "pred": not last_val,
-                    "conf": 70 + (sk - 5) * 4,
+                    "conf": 68 + (sk - 5) * 4,
                     "desc": f"Bệt {'Tài' if last_val else 'Xỉu'} {sk} ván — Dễ gãy",
-                    "break_risk": 65}
-        # ── Bệt ngắn (3-4): theo cầu
+                    "break_risk": 60}
+
         if sk >= 3:
             return {"type": "BỆT NGẮN", "len": sk, "pred": last_val,
-                    "conf": 56 + sk * 5,
+                    "conf": 58 + sk * 4,
                     "desc": f"Bệt {'Tài' if last_val else 'Xỉu'} {sk} ván — Theo cầu",
-                    "break_risk": 25}
+                    "break_risk": 22}
 
-        # ── Cầu 1-1 (ping-pong) — phát hiện 6 ván
+        if len(seq) >= 8 and all(seq[-(i+1)] != seq[-(i+2)] for i in range(6)):
+            return {"type": "CẦU 1-1", "len": 8, "pred": not seq[-1], "conf": 80,
+                    "desc": "Cầu ping-pong 1-1 dài → Tiếp tục xen kẽ", "break_risk": 18}
+
         if len(seq) >= 6 and all(seq[-(i+1)] != seq[-(i+2)] for i in range(4)):
             return {"type": "CẦU 1-1", "len": 6, "pred": not seq[-1], "conf": 76,
                     "desc": "Cầu ping-pong 1-1 → Tiếp tục xen kẽ", "break_risk": 22}
 
-        # ── Cầu 1-1 ngắn hơn (4 ván)
         if len(seq) >= 4 and all(seq[-(i+1)] != seq[-(i+2)] for i in range(2)):
-            return {"type": "CẦU 1-1 NGẮN", "len": 4, "pred": not seq[-1], "conf": 66,
+            return {"type": "CẦU 1-1 NGẮN", "len": 4, "pred": not seq[-1], "conf": 67,
                     "desc": "Cầu ping-pong 4 ván → Theo xen kẽ", "break_risk": 32}
 
-        # ── Cầu 2-2
         if len(seq) >= 8:
             r8 = seq[-8:]
             if (r8[0]==r8[1] and r8[1]!=r8[2] and r8[2]==r8[3] and
                     r8[3]!=r8[4] and r8[4]==r8[5] and r8[5]!=r8[6] and r8[6]==r8[7]):
-                return {"type": "CẦU 2-2", "len": 8, "pred": r8[-1], "conf": 74,
+                return {"type": "CẦU 2-2", "len": 8, "pred": r8[-1], "conf": 76,
                         "desc": "Cầu 2-2 → Tiếp tục theo cặp", "break_risk": 18}
 
-        # ── Cầu 3-3
+        if len(seq) >= 6:
+            r6 = seq[-6:]
+            if r6[0]==r6[1] and r6[1]!=r6[2] and r6[2]==r6[3] and r6[3]!=r6[4] and r6[4]==r6[5]:
+                return {"type": "CẦU 2-2 NGẮN", "len": 6, "pred": r6[-1], "conf": 70,
+                        "desc": "Cầu 2-2 ngắn → Theo cặp", "break_risk": 28}
+
         if len(seq) >= 12:
             r12 = seq[-12:]
             ok = all(r12[i*3]==r12[i*3+1]==r12[i*3+2] and
                      (i==0 or r12[i*3] != r12[(i-1)*3]) for i in range(4))
             if ok:
-                return {"type": "CẦU 3-3", "len": 12, "pred": r12[-1], "conf": 77,
+                return {"type": "CẦU 3-3", "len": 12, "pred": r12[-1], "conf": 78,
                         "desc": "Cầu 3-3 → Theo bộ 3", "break_risk": 14}
 
-        # ── Cầu 2-1 (AB pattern: AABAABAAB)
         if len(seq) >= 9:
             r9 = seq[-9:]
             a = r9[0]
-            if r9 == [a,a,not a, a,a,not a, a,a,not a]:
-                return {"type": "CẦU 2-1", "len": 9, "pred": not a, "conf": 80,
-                        "desc": "Cầu 2-1 → Dự đoán đổi chiều", "break_risk": 12}
+            if r9 == [a, a, not a, a, a, not a, a, a, not a]:
+                return {"type": "CẦU 2-1", "len": 9, "pred": not a, "conf": 82,
+                        "desc": "Cầu 2-1 → Đổi chiều", "break_risk": 12}
 
-        # ── Cầu 1-2 (ABBABBABB)
         if len(seq) >= 9:
             r9 = seq[-9:]
             a = r9[0]
             if r9 == [a, not a, not a, a, not a, not a, a, not a, not a]:
-                return {"type": "CẦU 1-2", "len": 9, "pred": a, "conf": 78,
+                return {"type": "CẦU 1-2", "len": 9, "pred": a, "conf": 80,
                         "desc": "Cầu 1-2 → Theo a", "break_risk": 14}
 
-        # ── Zigzag lệch
+        if len(seq) >= 12:
+            r12 = seq[-12:]
+            a = r12[0]
+            if r12 == [a, a, a, not a, a, a, a, not a, a, a, a, not a]:
+                return {"type": "CẦU 3-1", "len": 12, "pred": not a, "conf": 79,
+                        "desc": "Cầu 3-1 → Đổi chiều", "break_risk": 16}
+
+        if len(seq) >= 12:
+            r12 = seq[-12:]
+            a = r12[0]
+            if r12 == [a, not a, not a, not a, a, not a, not a, not a, a, not a, not a, not a]:
+                return {"type": "CẦU 1-3", "len": 12, "pred": a, "conf": 78,
+                        "desc": "Cầu 1-3 → Theo a", "break_risk": 16}
+
         if len(seq) >= 7:
             r7 = seq[-7:]
             changes = sum(1 for i in range(6) if r7[i] != r7[i+1])
             if changes >= 5:
                 return {"type": "ZIGZAG", "len": 7, "pred": not seq[-1], "conf": 68,
-                        "desc": "Zigzag lệch nhịp → Đổi chiều", "break_risk": 38}
+                        "desc": "Zigzag lệch → Đổi chiều", "break_risk": 38}
+
+        if len(seq) >= 10:
+            r10 = seq[-10:]
+            groups = []
+            cur = 1
+            for i in range(1, 10):
+                if r10[i] == r10[i-1]:
+                    cur += 1
+                else:
+                    groups.append(cur)
+                    cur = 1
+            groups.append(cur)
+            if len(groups) >= 4:
+                avg_g = sum(groups) / len(groups)
+                last_g = groups[-1]
+                if last_g >= avg_g * 1.8:
+                    return {"type": "BỆT BẤT THƯỜNG", "len": last_g, "pred": not seq[-1],
+                            "conf": 72, "desc": "Bệt vượt ngưỡng trung bình → Gãy sớm",
+                            "break_risk": 68}
 
         return {"type": "HỖN HỢP", "len": len(seq), "pred": None, "conf": 50,
-                "desc": "Xu hướng hỗn hợp — tín hiệu yếu", "break_risk": 50}
+                "desc": "Xu hướng hỗn hợp — chờ cầu rõ", "break_risk": 50}
 
 
 class AdvancedPredictor:
-    """
-    Engine dự đoán đa tầng với adaptive weighting.
-    28+ thuật toán song song, voting có trọng số động.
-    """
 
     _ALGO_DEFAULTS: Dict[str, float] = {
-        "cau_detect":    8.5,
-        "markov5":       7.0,
-        "markov4":       6.5,
-        "markov3":       6.0,
-        "markov2":       5.0,
-        "markov1":       3.5,
-        "pattern8":      6.5,
-        "pattern6":      6.0,
-        "pattern5":      5.5,
-        "pattern4":      5.0,
-        "pattern3":      4.5,
-        "streak_break":  6.0,
-        "zigzag":        4.0,
-        "gap_analysis":  4.5,
-        "window10":      4.0,
-        "window20":      3.5,
-        "window50":      2.5,
-        "entropy":       3.5,
-        "run_length":    4.0,
-        "oscillation":   4.5,
-        "chi_balance":   3.0,
-        "score_trend":   4.0,
-        "adaptive_ma":   3.5,
-        "linear_reg":    3.5,
-        "perceptron":    4.5,
-        "cycle_detect":  3.5,
-        "hot_cold":      3.0,
-        "prob_weight":   2.5,
-        "momentum":      5.0,
-        "reversal":      4.5,
-        "support_resist":3.5,
+        "cau_detect":      9.0,
+        "markov5":         7.5,
+        "markov4":         7.0,
+        "markov3":         6.5,
+        "markov2":         5.5,
+        "markov1":         3.5,
+        "pattern8":        7.0,
+        "pattern6":        6.5,
+        "pattern5":        6.0,
+        "pattern4":        5.5,
+        "pattern3":        5.0,
+        "streak_break":    6.5,
+        "zigzag":          4.5,
+        "gap_analysis":    5.0,
+        "window10":        4.5,
+        "window20":        4.0,
+        "window50":        3.0,
+        "entropy":         4.0,
+        "run_length":      4.5,
+        "oscillation":     4.5,
+        "chi_balance":     3.5,
+        "score_trend":     4.5,
+        "adaptive_ma":     4.0,
+        "linear_reg":      4.0,
+        "perceptron":      5.5,
+        "cycle_detect":    4.0,
+        "hot_cold":        3.5,
+        "prob_weight":     3.0,
+        "momentum":        5.5,
+        "reversal":        5.0,
+        "support_resist":  4.0,
+        "bayesian":        6.0,
+        "anti_streak":     5.5,
+        "trend_follow":    4.5,
+        "mean_revert":     4.0,
+        "double_markov":   5.5,
+        "transition_prob": 5.0,
+        "block_analysis":  4.5,
+        "volatility":      3.5,
+        "consensus_vote":  6.5,
+        "score_dist":      3.5,
+        "entropy_rate":    4.0,
     }
 
     def __init__(self, game_mode: str):
@@ -503,11 +505,10 @@ class AdvancedPredictor:
                 self.weights[k] = v
 
     def update_weights_bulk(self, algo_names: List[str], correct: bool):
-        """Cập nhật trọng số cho nhiều thuật toán cùng lúc."""
         updates = []
         for algo in algo_names:
             w = self.weights.get(algo, 1.0)
-            self.weights[algo] = min(15.0, w * 1.12) if correct else max(0.25, w * 0.88)
+            self.weights[algo] = min(20.0, w * 1.10) if correct else max(0.20, w * 0.90)
             updates.append(algo)
         try:
             with _db() as db:
@@ -529,10 +530,8 @@ class AdvancedPredictor:
     def w(self, name: str) -> float:
         return self.weights.get(name, 1.0)
 
-    # ── Algorithms ──────────────────────────────────────────────────────
-
     def _markov(self, seq: List[bool], order: int) -> Optional[Tuple[bool, float]]:
-        if len(seq) < order + 4:
+        if len(seq) < order + 5:
             return None
         pat = tuple(seq[-order:])
         cnt: Counter = Counter()
@@ -544,12 +543,212 @@ class AdvancedPredictor:
             return None
         best, n = cnt.most_common(1)[0]
         conf = n / total
-        if conf < 0.55:
+        if conf < 0.54:
             return None
-        return best, min(conf, 0.92)
+        return best, min(conf, 0.93)
+
+    def _double_markov(self, seq: List[bool]) -> Optional[Tuple[bool, float]]:
+        if len(seq) < 14:
+            return None
+        results = []
+        for order in [3, 4, 5]:
+            r = self._markov(seq, order)
+            if r:
+                results.append(r)
+        if len(results) < 2:
+            return None
+        tai_w = sum(c for p, c in results if p)
+        xiu_w = sum(c for p, c in results if not p)
+        total = tai_w + xiu_w
+        if total == 0:
+            return None
+        pred = tai_w >= xiu_w
+        conf = max(tai_w, xiu_w) / total
+        if conf < 0.58:
+            return None
+        return pred, min(conf, 0.90)
+
+    def _transition_prob(self, seq: List[bool]) -> Optional[Tuple[bool, float]]:
+        if len(seq) < 20:
+            return None
+        tt = tx = xt = xx = 0
+        for i in range(len(seq) - 1):
+            a, b = seq[i], seq[i+1]
+            if a and b:       tt += 1
+            elif a and not b: tx += 1
+            elif not a and b: xt += 1
+            else:             xx += 1
+        last = seq[-1]
+        if last:
+            total = tt + tx
+            if total < 4:
+                return None
+            prob_tai = tt / total
+            pred = prob_tai >= 0.5
+            conf = max(prob_tai, 1 - prob_tai)
+        else:
+            total = xt + xx
+            if total < 4:
+                return None
+            prob_tai = xt / total
+            pred = prob_tai >= 0.5
+            conf = max(prob_tai, 1 - prob_tai)
+        if conf < 0.54:
+            return None
+        return pred, min(conf, 0.88)
+
+    def _bayesian(self, seq: List[bool]) -> Optional[Tuple[bool, float]]:
+        if len(seq) < 15:
+            return None
+        prior_tai = 0.5
+        alpha = 2.0
+        recent = seq[-30:] if len(seq) >= 30 else seq
+        n = len(recent)
+        k = sum(recent)
+        posterior_tai = (k + alpha * prior_tai) / (n + alpha)
+        posterior_xiu = 1 - posterior_tai
+        if abs(posterior_tai - 0.5) < 0.08:
+            return None
+        pred = posterior_tai > 0.5
+        conf = min(0.52 + abs(posterior_tai - 0.5) * 1.2, 0.85)
+        sk, last = CauDetector.streak(seq)
+        if sk >= 4 and last == pred:
+            pass
+        elif sk >= 4 and last != pred:
+            conf = min(conf * 1.1, 0.88)
+        return pred, conf
+
+    def _anti_streak(self, seq: List[bool]) -> Optional[Tuple[bool, float]]:
+        if len(seq) < 5:
+            return None
+        sk, last = CauDetector.streak(seq)
+        if sk < 5:
+            return None
+        base_conf = min(0.60 + (sk - 5) * 0.05, 0.90)
+        if sk >= 10:
+            base_conf = min(0.85 + (sk - 10) * 0.02, 0.95)
+        return not last, base_conf
+
+    def _block_analysis(self, seq: List[bool]) -> Optional[Tuple[bool, float]]:
+        if len(seq) < 20:
+            return None
+        block_size = 5
+        n_blocks = min(len(seq) // block_size, 8)
+        block_ratios = []
+        for i in range(n_blocks):
+            chunk = seq[-(i+1)*block_size : -i*block_size if i > 0 else None]
+            if chunk:
+                block_ratios.append(sum(chunk) / len(chunk))
+        if len(block_ratios) < 3:
+            return None
+        trend = block_ratios[0] - block_ratios[-1]
+        if abs(trend) < 0.15:
+            return None
+        pred = trend > 0
+        conf = min(0.54 + abs(trend) * 0.5, 0.80)
+        return pred, conf
+
+    def _volatility(self, seq: List[bool]) -> Optional[Tuple[bool, float]]:
+        if len(seq) < 15:
+            return None
+        r10 = seq[-10:]
+        changes = sum(1 for i in range(9) if r10[i] != r10[i+1])
+        r5 = sum(r10[-5:]) / 5
+        if changes >= 8:
+            return not seq[-1], 0.70
+        if changes <= 2:
+            sk, last = CauDetector.streak(seq)
+            if sk >= 5:
+                return not last, min(0.62 + sk * 0.03, 0.84)
+            return last, 0.62
+        return None
+
+    def _trend_follow(self, seq: List[bool]) -> Optional[Tuple[bool, float]]:
+        if len(seq) < 20:
+            return None
+        r5  = sum(seq[-5:]) / 5
+        r10 = sum(seq[-10:]) / 10
+        r20 = sum(seq[-20:]) / 20
+        if r5 > r10 > r20 and r5 > 0.65:
+            momentum = r5 - r20
+            return True, min(0.56 + momentum * 0.8, 0.82)
+        if r5 < r10 < r20 and r5 < 0.35:
+            momentum = r20 - r5
+            return False, min(0.56 + momentum * 0.8, 0.82)
+        return None
+
+    def _mean_revert(self, seq: List[bool]) -> Optional[Tuple[bool, float]]:
+        if len(seq) < 20:
+            return None
+        r5  = sum(seq[-5:]) / 5
+        r20 = sum(seq[-20:]) / 20
+        dev = r5 - r20
+        if abs(dev) < 0.25:
+            return None
+        pred = dev < 0
+        conf = min(0.54 + abs(dev) * 0.7, 0.80)
+        return pred, conf
+
+    def _score_dist(self, scores: List[int]) -> Optional[Tuple[bool, float]]:
+        if len(scores) < 10:
+            return None
+        cnt = Counter()
+        for d1 in range(1, 7):
+            for d2 in range(1, 7):
+                for d3 in range(1, 7):
+                    cnt[d1+d2+d3] += 1
+        dp = {s: c/216 for s, c in cnt.items()}
+        recent = scores[-15:]
+        tai_expected = sum(dp.get(s, 0) for s in range(11, 19)) * 216
+        xiu_expected = sum(dp.get(s, 0) for s in range(3, 11)) * 216
+        recent_tai = sum(1 for s in recent if s > 10)
+        recent_xiu = len(recent) - recent_tai
+        tai_dev = recent_tai / max(len(recent) * tai_expected / 216, 1)
+        xiu_dev = recent_xiu / max(len(recent) * xiu_expected / 216, 1)
+        if tai_dev > 1.4:
+            return False, min(0.54 + (tai_dev - 1.4) * 0.2, 0.76)
+        if xiu_dev > 1.4:
+            return True, min(0.54 + (xiu_dev - 1.4) * 0.2, 0.76)
+        return None
+
+    def _entropy_rate(self, seq: List[bool]) -> Optional[Tuple[bool, float]]:
+        if len(seq) < 20:
+            return None
+        bigrams: Counter = Counter()
+        for i in range(len(seq) - 1):
+            bigrams[(seq[i], seq[i+1])] += 1
+        total_bg = sum(bigrams.values())
+        if total_bg == 0:
+            return None
+        H = 0.0
+        for v in bigrams.values():
+            p = v / total_bg
+            H -= p * math.log2(p)
+        last = seq[-1]
+        if H < 1.4:
+            if last:
+                p_tt = bigrams.get((True, True), 0) / max(bigrams.get((True, True), 0) + bigrams.get((True, False), 0), 1)
+                return (True, 0.62 + (1.4 - H) * 0.15) if p_tt > 0.55 else (False, 0.62 + (1.4 - H) * 0.15)
+            else:
+                p_xx = bigrams.get((False, False), 0) / max(bigrams.get((False, True), 0) + bigrams.get((False, False), 0), 1)
+                return (False, 0.62 + (1.4 - H) * 0.15) if p_xx > 0.55 else (True, 0.62 + (1.4 - H) * 0.15)
+        return None
+
+    def _consensus_vote(self, algos_results: list) -> Optional[Tuple[bool, float]]:
+        if len(algos_results) < 8:
+            return None
+        tai_votes = sum(1 for p, c, w, _ in algos_results if p)
+        xiu_votes = len(algos_results) - tai_votes
+        total = len(algos_results)
+        ratio = max(tai_votes, xiu_votes) / total
+        if ratio < 0.68:
+            return None
+        pred = tai_votes >= xiu_votes
+        conf = min(0.56 + (ratio - 0.68) * 1.2, 0.88)
+        return pred, conf
 
     def _pattern(self, seq: List[bool], depth: int) -> Optional[Tuple[bool, float]]:
-        if len(seq) < depth + 4:
+        if len(seq) < depth + 5:
             return None
         pat = tuple(seq[-depth:])
         cnt: Counter = Counter()
@@ -561,74 +760,71 @@ class AdvancedPredictor:
             return None
         best, n = cnt.most_common(1)[0]
         conf = n / total
-        if conf < 0.55:
+        if conf < 0.54:
             return None
-        return best, min(conf, 0.90)
+        return best, min(conf, 0.91)
 
     def _streak_analysis(self, seq: List[bool]) -> Optional[Tuple[bool, float]]:
         if len(seq) < 3:
             return None
         sk, last = CauDetector.streak(seq)
-        if sk >= 8:
-            return not last, min(0.82 + (sk - 8) * 0.025, 0.94)
+        if sk >= 10:
+            return not last, min(0.85 + (sk - 10) * 0.02, 0.95)
+        if sk >= 7:
+            return not last, 0.75 + (sk - 7) * 0.03
         if sk >= 5:
-            return not last, 0.70 + (sk - 5) * 0.04
+            return not last, 0.68 + (sk - 5) * 0.035
         if sk == 4:
-            return last, 0.67
+            return last, 0.65
         if sk == 3:
-            return last, 0.62
+            return last, 0.60
         return None
 
     def _momentum(self, seq: List[bool]) -> Optional[Tuple[bool, float]]:
-        """Đo động lượng xu hướng ngắn hạn (3/5/10 ván)."""
         if len(seq) < 10:
             return None
         w3  = sum(seq[-3:]) / 3
         w5  = sum(seq[-5:]) / 5
         w10 = sum(seq[-10:]) / 10
-        # Momentum: xu hướng tăng tốc
         mom = w3 * 0.5 + w5 * 0.3 + w10 * 0.2
-        if mom > 0.70:
-            return True, min(0.58 + (mom - 0.70) * 1.5, 0.80)
-        if mom < 0.30:
-            return False, min(0.58 + (0.30 - mom) * 1.5, 0.80)
+        if mom > 0.72:
+            return True, min(0.58 + (mom - 0.72) * 1.6, 0.82)
+        if mom < 0.28:
+            return False, min(0.58 + (0.28 - mom) * 1.6, 0.82)
         return None
 
     def _reversal(self, seq: List[bool]) -> Optional[Tuple[bool, float]]:
-        """Phát hiện điểm đảo chiều sau xung lượng cực đoan."""
         if len(seq) < 15:
             return None
         r5  = sum(seq[-5:]) / 5
         r15 = sum(seq[-15:]) / 15
         diff = r5 - r15
-        # Xung lượng ngắn hạn lệch mạnh so với dài hạn → đảo chiều
-        if diff > 0.35:
-            return False, min(0.60 + diff * 0.6, 0.82)
-        if diff < -0.35:
-            return True, min(0.60 + abs(diff) * 0.6, 0.82)
+        if diff > 0.38:
+            return False, min(0.60 + diff * 0.65, 0.84)
+        if diff < -0.38:
+            return True, min(0.60 + abs(diff) * 0.65, 0.84)
         return None
 
     def _support_resist(self, seq: List[bool]) -> Optional[Tuple[bool, float]]:
-        """Mức hỗ trợ/kháng cự xác suất — nếu một phía xuất hiện quá nhiều, mean revert."""
         if len(seq) < 30:
             return None
         r30 = sum(seq[-30:]) / 30
         r10 = sum(seq[-10:]) / 10
-        # Vùng kháng cự Tài: r30 > 0.7 và r10 > 0.75
-        if r30 > 0.70 and r10 > 0.72:
-            return False, min(0.58 + (r30 - 0.70) * 0.8, 0.78)
-        # Vùng hỗ trợ Xỉu
-        if r30 < 0.30 and r10 < 0.28:
-            return True, min(0.58 + (0.30 - r30) * 0.8, 0.78)
+        if r30 > 0.68 and r10 > 0.70:
+            return False, min(0.58 + (r30 - 0.68) * 0.9, 0.80)
+        if r30 < 0.32 and r10 < 0.30:
+            return True, min(0.58 + (0.32 - r30) * 0.9, 0.80)
         return None
 
     def _zigzag_detect(self, seq: List[bool]) -> Optional[Tuple[bool, float]]:
         if len(seq) < 6:
             return None
+        if all(seq[-(i+1)] != seq[-(i+2)] for i in range(5)):
+            return not seq[-1], 0.80
         if all(seq[-(i+1)] != seq[-(i+2)] for i in range(4)):
-            return not seq[-1], 0.75
+            return not seq[-1], 0.76
         if len(seq) >= 4 and all(seq[-(i+1)] != seq[-(i+2)] for i in range(2)):
-            return not seq[-1], 0.64
+            return not seq[-1], 0.66
         return None
 
     def _gap_analysis(self, seq: List[bool]) -> Optional[Tuple[bool, float]]:
@@ -643,11 +839,11 @@ class AdvancedPredictor:
         cur = len(seq) - 1
         dt = cur - tp[-1]
         df = cur - fp[-1]
-        if dt >= avg_tg * 1.7:
-            c = min(0.60 + (dt - avg_tg) / avg_tg * 0.07, 0.82)
+        if dt >= avg_tg * 1.6:
+            c = min(0.60 + (dt - avg_tg) / max(avg_tg, 1) * 0.08, 0.84)
             return True, c
-        if df >= avg_fg * 1.7:
-            c = min(0.60 + (df - avg_fg) / avg_fg * 0.07, 0.82)
+        if df >= avg_fg * 1.6:
+            c = min(0.60 + (df - avg_fg) / max(avg_fg, 1) * 0.08, 0.84)
             return False, c
         return None
 
@@ -656,10 +852,10 @@ class AdvancedPredictor:
         if len(chunk) < max(window // 2, 5):
             return None
         r = sum(chunk) / len(chunk)
-        if abs(r - 0.5) < 0.16:
+        if abs(r - 0.5) < 0.15:
             return None
-        pred = r < 0.5   # mean reversion
-        conf = min(0.52 + abs(r - 0.5) * 0.75, 0.80)
+        pred = r < 0.5
+        conf = min(0.52 + abs(r - 0.5) * 0.80, 0.82)
         return pred, conf
 
     def _entropy_analysis(self, seq: List[bool]) -> Optional[Tuple[bool, float]]:
@@ -668,13 +864,17 @@ class AdvancedPredictor:
         w12 = seq[-12:]
         tc = sum(w12)
         if tc >= 11:
-            return False, 0.82
+            return False, 0.86
         if tc <= 1:
-            return True, 0.82
+            return True, 0.86
         if tc >= 10:
-            return False, 0.76
+            return False, 0.80
         if tc <= 2:
-            return True, 0.76
+            return True, 0.80
+        if tc >= 9:
+            return False, 0.74
+        if tc <= 3:
+            return True, 0.74
         return None
 
     def _run_length(self, seq: List[bool]) -> Optional[Tuple[bool, float]]:
@@ -693,10 +893,10 @@ class AdvancedPredictor:
             return None
         avg_run = sum(runs) / len(runs)
         sk, last = CauDetector.streak(seq)
-        if sk >= avg_run * 1.9:
-            return not last, min(0.64 + (sk / avg_run - 1.9) * 0.05, 0.84)
-        if sk <= avg_run * 0.4 and sk >= 2:
-            return last, 0.62
+        if sk >= avg_run * 1.8:
+            return not last, min(0.64 + (sk / max(avg_run, 1) - 1.8) * 0.06, 0.86)
+        if sk <= avg_run * 0.35 and sk >= 2:
+            return last, 0.63
         return None
 
     def _oscillation(self, seq: List[bool]) -> Optional[Tuple[bool, float]]:
@@ -704,22 +904,24 @@ class AdvancedPredictor:
             return None
         changes = sum(1 for i in range(len(seq)-12, len(seq)-1) if seq[i] != seq[i+1])
         if changes >= 10:
-            return not seq[-1], 0.72
+            return not seq[-1], 0.74
+        if changes >= 9:
+            return not seq[-1], 0.70
         if changes <= 2:
             sk, last = CauDetector.streak(seq)
             if sk >= 5:
-                return not last, 0.74
+                return not last, min(0.68 + sk * 0.02, 0.84)
         return None
 
     def _chi_balance(self, seq: List[bool]) -> Optional[Tuple[bool, float]]:
-        w = seq[-30:] if len(seq) >= 30 else seq
+        w = seq[-40:] if len(seq) >= 40 else seq
         if not w:
             return None
         r = sum(w) / len(w)
-        if abs(r - 0.5) < 0.14:
+        if abs(r - 0.5) < 0.12:
             return None
         pred = r < 0.5
-        conf = min(0.52 + abs(r - 0.5) * 0.55, 0.74)
+        conf = min(0.52 + abs(r - 0.5) * 0.65, 0.78)
         return pred, conf
 
     def _score_trend(self, scores: List[int]) -> Optional[Tuple[bool, float]]:
@@ -730,7 +932,7 @@ class AdvancedPredictor:
         diff = r5 - o5
         if abs(diff) < 0.8:
             return None
-        return diff > 0, min(0.54 + abs(diff) * 0.04, 0.78)
+        return diff > 0, min(0.54 + abs(diff) * 0.045, 0.80)
 
     def _adaptive_ma(self, scores: List[int]) -> Optional[Tuple[bool, float]]:
         if len(scores) < 20:
@@ -740,7 +942,7 @@ class AdvancedPredictor:
         diff = ma5 - ma20
         if abs(diff) < 0.5:
             return None
-        return diff > 0, min(0.54 + abs(diff) * 0.035, 0.78)
+        return diff > 0, min(0.54 + abs(diff) * 0.04, 0.80)
 
     def _linear_reg(self, scores: List[int]) -> Optional[Tuple[bool, float]]:
         if len(scores) < 12:
@@ -757,50 +959,56 @@ class AdvancedPredictor:
         slope = (n*sxy - sx*sy) / d
         base = sum(y[-3:]) / 3
         pred_score = base + slope * 2
-        if pred_score > 14.0:
-            return False, 0.64
-        if pred_score < 7.0:
-            return True, 0.64
-        if pred_score > 12.5:
-            return False, 0.58
-        if pred_score < 8.5:
-            return True, 0.58
+        if pred_score > 14.5:
+            return False, 0.68
+        if pred_score < 6.5:
+            return True, 0.68
+        if pred_score > 13.0:
+            return False, 0.61
+        if pred_score < 8.0:
+            return True, 0.61
         return None
 
     def _perceptron(self, seq: List[bool], scores: List[int]) -> Optional[Tuple[bool, float]]:
-        if len(seq) < 12:
+        if len(seq) < 15:
             return None
         l5  = seq[-5:]
-        tr  = sum(seq[-12:]) / 12
-        avg = sum(scores[-7:]) / 7 if len(scores) >= 7 else 10.5
-        # 8 features
+        l3  = seq[-3:]
+        tr12 = sum(seq[-12:]) / 12
+        tr20 = sum(seq[-20:]) / min(len(seq), 20)
+        avg7 = sum(scores[-7:]) / 7 if len(scores) >= 7 else 10.5
+        sk, last = CauDetector.streak(seq)
         feats = [
             l5[0]*2-1, l5[1]*2-1, l5[2]*2-1, l5[3]*2-1, l5[4]*2-1,
-            (tr - 0.5) * 2,
-            (avg - 10.5) / 5,
-            (CauDetector.streak(seq)[0] - 3) / 4,
+            l3[0]*2-1, l3[1]*2-1, l3[2]*2-1,
+            (tr12 - 0.5) * 2,
+            (tr20 - 0.5) * 2,
+            (avg7 - 10.5) / 5,
+            (sk - 3) / 5,
+            (1 if last else -1),
         ]
-        ws = [0.35, 0.30, 0.25, 0.20, 0.15, 0.60, 0.45, 0.30]
+        ws = [0.35, 0.30, 0.26, 0.22, 0.18, 0.40, 0.35, 0.30,
+              0.65, 0.45, 0.50, 0.35, 0.28]
         bias = 0.05
-        dot = sum(f*w for f, w in zip(feats, ws)) + bias
-        prob = 1 / (1 + math.exp(-dot * 1.2))
-        if prob > 0.60:
-            return True, min(prob, 0.86)
-        if prob < 0.40:
-            return False, min(1-prob, 0.86)
+        dot = sum(f * w for f, w in zip(feats, ws)) + bias
+        prob = 1 / (1 + math.exp(-dot * 1.3))
+        if prob > 0.62:
+            return True, min(prob, 0.90)
+        if prob < 0.38:
+            return False, min(1-prob, 0.90)
         return None
 
     def _cycle_detect(self, seq: List[bool]) -> Optional[Tuple[bool, float]]:
         if len(seq) < 24:
             return None
         best_lag, best_corr = None, 0.0
-        for lag in range(2, min(16, len(seq)//2)):
+        for lag in range(2, min(18, len(seq)//2)):
             n = len(seq) - lag
             corr = sum(1 for i in range(n) if seq[i] == seq[i+lag]) / n
             if corr > best_corr:
                 best_corr, best_lag = corr, lag
-        if best_corr > 0.70 and best_lag and len(seq) > best_lag:
-            return seq[-best_lag], min(0.52 + best_corr * 0.35, 0.82)
+        if best_corr > 0.68 and best_lag and len(seq) > best_lag:
+            return seq[-best_lag], min(0.52 + best_corr * 0.40, 0.84)
         return None
 
     def _hot_cold(self, scores: List[int]) -> Optional[Tuple[bool, float]]:
@@ -810,36 +1018,34 @@ class AdvancedPredictor:
         ht = sum(1 for s in recent if s > 13)
         hx = sum(1 for s in recent if s < 7)
         avg5 = sum(scores[-5:]) / 5
-        if avg5 > 14.5 and ht > 9:
-            return False, 0.70
-        if avg5 < 5.5 and hx > 9:
-            return True, 0.70
-        if avg5 > 13.5 and ht > 7:
-            return False, 0.63
-        if avg5 < 6.5 and hx > 7:
-            return True, 0.63
+        if avg5 > 15.0 and ht > 9:
+            return False, 0.74
+        if avg5 < 5.0 and hx > 9:
+            return True, 0.74
+        if avg5 > 14.0 and ht > 7:
+            return False, 0.67
+        if avg5 < 6.0 and hx > 7:
+            return True, 0.67
         return None
 
     def _prob_weight(self, scores: List[int]) -> Optional[Tuple[bool, float]]:
         if len(scores) < 10:
             return None
-        # Xác suất xúc xắc 3 viên
         cnt: Counter = Counter()
         for d1 in range(1, 7):
             for d2 in range(1, 7):
                 for d3 in range(1, 7):
                     cnt[d1+d2+d3] += 1
         dp = {s: c/216 for s, c in cnt.items()}
-        recent = scores[-10:]
+        recent = scores[-12:]
         lo = sum(dp.get(s, 0) for s in recent if s <= 10)
         hi = sum(dp.get(s, 0) for s in recent if s > 10)
-        if hi > lo * 1.5:
-            return False, 0.60
-        if lo > hi * 1.5:
-            return True, 0.60
+        if hi > lo * 1.6:
+            return False, 0.63
+        if lo > hi * 1.6:
+            return True, 0.63
         return None
 
-    # ── Main predict ────────────────────────────────────────────────────
     def predict(self, state: dict) -> dict:
         history = state["history"]
         if len(history) < 8:
@@ -858,8 +1064,7 @@ class AdvancedPredictor:
 
         cau = CauDetector.detect(seq)
 
-        # ── Thu thập phiếu có trọng số ──────────────────────────────────
-        algos_results = []   # (pred:bool, conf:float, weight:float, name:str)
+        algos_results = []
 
         def vote(name: str, fn):
             try:
@@ -870,113 +1075,125 @@ class AdvancedPredictor:
             except Exception as e:
                 log.debug("algo %s: %s", name, e)
 
-        # Cầu (trọng số cao nhất)
         if cau["pred"] is not None:
             algos_results.append((cau["pred"], cau["conf"]/100, self.w("cau_detect"), "cau_detect"))
 
-        # Markov chains
         for order, name in [(5,"markov5"),(4,"markov4"),(3,"markov3"),(2,"markov2"),(1,"markov1")]:
             vote(name, lambda o=order: self._markov(seq, o))
 
-        # Pattern matching
+        vote("double_markov",   lambda: self._double_markov(seq))
+        vote("transition_prob", lambda: self._transition_prob(seq))
+
         for depth, name in [(8,"pattern8"),(6,"pattern6"),(5,"pattern5"),(4,"pattern4"),(3,"pattern3")]:
             vote(name, lambda d=depth: self._pattern(seq, d))
 
-        # Streak & structure
         vote("streak_break",  lambda: self._streak_analysis(seq))
+        vote("anti_streak",   lambda: self._anti_streak(seq))
         vote("zigzag",        lambda: self._zigzag_detect(seq))
         vote("gap_analysis",  lambda: self._gap_analysis(seq))
         vote("oscillation",   lambda: self._oscillation(seq))
         vote("momentum",      lambda: self._momentum(seq))
         vote("reversal",      lambda: self._reversal(seq))
         vote("support_resist",lambda: self._support_resist(seq))
+        vote("trend_follow",  lambda: self._trend_follow(seq))
+        vote("mean_revert",   lambda: self._mean_revert(seq))
+        vote("block_analysis",lambda: self._block_analysis(seq))
+        vote("volatility",    lambda: self._volatility(seq))
+        vote("bayesian",      lambda: self._bayesian(seq))
 
-        # Frequency & window
-        vote("window10",  lambda: self._window_freq(seq, 10))
-        vote("window20",  lambda: self._window_freq(seq, 20))
-        vote("window50",  lambda: self._window_freq(seq, 50))
-        vote("entropy",   lambda: self._entropy_analysis(seq))
-        vote("run_length",lambda: self._run_length(seq))
+        vote("window10",   lambda: self._window_freq(seq, 10))
+        vote("window20",   lambda: self._window_freq(seq, 20))
+        vote("window50",   lambda: self._window_freq(seq, 50))
+        vote("entropy",    lambda: self._entropy_analysis(seq))
+        vote("run_length", lambda: self._run_length(seq))
         vote("chi_balance",lambda: self._chi_balance(seq))
+        vote("entropy_rate",lambda: self._entropy_rate(seq))
 
-        # Score-based
         vote("score_trend",  lambda: self._score_trend(scores))
         vote("adaptive_ma",  lambda: self._adaptive_ma(scores))
         vote("linear_reg",   lambda: self._linear_reg(scores))
         vote("hot_cold",     lambda: self._hot_cold(scores))
         vote("prob_weight",  lambda: self._prob_weight(scores))
+        vote("score_dist",   lambda: self._score_dist(scores))
 
-        # ML-style
         vote("perceptron",  lambda: self._perceptron(seq, scores))
         vote("cycle_detect",lambda: self._cycle_detect(seq))
 
         if not algos_results:
-            return {**self._empty("Không đủ tín hiệu"),
-                    "cau_type": cau["type"], "cau_desc": cau["desc"]}
+            return {**self._empty("Không đủ tín hiệu"), "cau_type": cau["type"], "cau_desc": cau["desc"]}
 
-        # ── Weighted voting ─────────────────────────────────────────────
+        consensus_r = self._consensus_vote(algos_results)
+        if consensus_r is not None:
+            algos_results.append((consensus_r[0], consensus_r[1], self.w("consensus_vote"), "consensus_vote"))
+
         tai_score = sum(c * w for p, c, w, _ in algos_results if p)
         xiu_score = sum(c * w for p, c, w, _ in algos_results if not p)
         total = tai_score + xiu_score
 
         if total == 0:
-            return {**self._empty("Tín hiệu trung hoà"),
-                    "algo_count": len(algos_results),
+            return {**self._empty("Tín hiệu trung hoà"), "algo_count": len(algos_results),
                     "cau_type": cau["type"], "cau_desc": cau["desc"]}
 
         pred_bool = tai_score >= xiu_score
         consensus = max(tai_score, xiu_score) / total
 
-        # ── Tạm dừng khi thua liên tiếp + tín hiệu yếu ─────────────────
         cl = state.get("consec_loss", 0)
-        if cl >= 5 and consensus < 0.72:
-            return {**self._empty(
-                f"🔴 Tạm dừng — Sai {cl} lần liên tiếp, đợi tín hiệu ≥72%"),
-                "algo_count": len(algos_results),
-                "cau_type": cau["type"], "cau_desc": cau["desc"]}
+        if cl >= 6 and consensus < 0.74:
+            return {**self._empty(f"🔴 Tạm dừng — Sai {cl} lần liên tiếp, chờ tín hiệu ≥74%"),
+                    "algo_count": len(algos_results), "cau_type": cau["type"], "cau_desc": cau["desc"]}
+
+        if cl >= 4 and consensus < 0.68:
+            return {**self._empty(f"⚠️ Thận trọng — Sai {cl} lần, chờ tín hiệu mạnh hơn"),
+                    "algo_count": len(algos_results), "cau_type": cau["type"], "cau_desc": cau["desc"]}
 
         if consensus < MIN_CONF_PREDICT:
-            return {**self._empty(
-                f"⚠️ Tín hiệu yếu ({consensus:.0%}) — Chờ cầu rõ hơn"),
-                "confidence": int(consensus * 100),
-                "algo_count": len(algos_results),
-                "cau_type": cau["type"], "cau_desc": cau["desc"]}
+            return {**self._empty(f"⚠️ Tín hiệu yếu ({consensus:.0%}) — Chờ cầu rõ hơn"),
+                    "confidence": int(consensus * 100), "algo_count": len(algos_results),
+                    "cau_type": cau["type"], "cau_desc": cau["desc"]}
 
-        # ── Calibrate confidence ─────────────────────────────────────────
-        confidence = max(54, min(96, int(consensus * 100)))
+        confidence = max(55, min(97, int(consensus * 100)))
 
-        # Penalty nếu dự đoán chiều đang over-represented
-        recent20 = seq[-20:] if len(seq) >= 20 else seq
-        if recent20:
+        if len(seq) >= 20:
+            recent20 = seq[-20:]
             r20 = sum(recent20) / len(recent20)
-            if (pred_bool and r20 > 0.78) or (not pred_bool and r20 < 0.22):
-                confidence = max(50, confidence - 8)
+            if (pred_bool and r20 > 0.80) or (not pred_bool and r20 < 0.20):
+                confidence = max(52, confidence - 10)
 
-        # Bonus nếu nhiều layer đồng thuận với cau_detect
-        if cau["pred"] == pred_bool and cau["conf"] >= 70:
-            confidence = min(96, confidence + 4)
+        if cau["pred"] == pred_bool and cau["conf"] >= 68:
+            confidence = min(97, confidence + 5)
+        elif cau["pred"] is not None and cau["pred"] != pred_bool and cau["conf"] >= 75:
+            confidence = max(52, confidence - 6)
 
-        # ── Position prediction (SicBo only) ────────────────────────────
+        tai_vote_count = sum(1 for p, c, w, _ in algos_results if p)
+        xiu_vote_count = len(algos_results) - tai_vote_count
+        maj_ratio = max(tai_vote_count, xiu_vote_count) / max(len(algos_results), 1)
+        if maj_ratio >= 0.80:
+            confidence = min(97, confidence + 3)
+        elif maj_ratio < 0.60:
+            confidence = max(52, confidence - 5)
+
         vi1 = vi2 = vi3 = 0
         if self.gm not in TX_ONLY_GAMES:
-            rel_scores = [s for s in scores[-80:] if (s > 10) == pred_bool]
+            rel_scores = [s for s in scores[-100:] if (s > 10) == pred_bool]
             if len(rel_scores) < 4:
                 rel_scores = list(range(11, 18)) if pred_bool else list(range(3, 11))
             cnt2 = Counter(rel_scores)
-            top = [v for v, _ in cnt2.most_common(12)]
+            top = [v for v, _ in cnt2.most_common(15)]
             prev = state.get("prev_pred", {})
             pvs = {prev.get("vi1"), prev.get("vi2"), prev.get("vi3")}
             fresh = [v for v in top if v not in pvs] or top
             random.shuffle(fresh)
             sel = fresh[:3]
-            while len(sel) < 3:
+            attempts = 0
+            while len(sel) < 3 and attempts < 20:
                 e = random.randint(11, 17) if pred_bool else random.randint(3, 10)
                 if e not in sel:
                     sel.append(e)
+                attempts += 1
             sel.sort()
-            vi1, vi2, vi3 = sel[0], sel[1], sel[2]
+            if len(sel) >= 3:
+                vi1, vi2, vi3 = sel[0], sel[1], sel[2]
 
-        # ── History summary ──────────────────────────────────────────────
         hw_parts = []
         for ws in [20, 50, 100]:
             chunk = seq[-ws:] if len(seq) >= ws else seq
@@ -985,20 +1202,21 @@ class AdvancedPredictor:
                 x = len(chunk) - t
                 hw_parts.append(f"{ws}v:{t}T/{x}X")
 
-        # Algo names that voted for winner (for weight update)
         winner_algos = [name for p, c, w, name in algos_results if p == pred_bool]
 
         return {
-            "pred":          "TÀI" if pred_bool else "XỈU",
+            "pred":           "TÀI" if pred_bool else "XỈU",
             "vi1": vi1, "vi2": vi2, "vi3": vi3,
-            "confidence":    confidence,
-            "algo_count":    len(algos_results),
-            "cau_type":      cau["type"],
-            "cau_desc":      cau["desc"],
-            "cau_break_risk":cau.get("break_risk", 0),
+            "confidence":     confidence,
+            "algo_count":     len(algos_results),
+            "cau_type":       cau["type"],
+            "cau_desc":       cau["desc"],
+            "cau_break_risk": cau.get("break_risk", 0),
             "history_windows": "  ".join(hw_parts),
-            "consensus":     consensus,
-            "winner_algos":  winner_algos,
+            "consensus":      consensus,
+            "winner_algos":   winner_algos,
+            "tai_votes":      tai_vote_count,
+            "xiu_votes":      xiu_vote_count,
         }
 
     def _empty(self, note: str = "") -> dict:
@@ -1008,6 +1226,7 @@ class AdvancedPredictor:
             "cau_type": "—", "cau_desc": "",
             "cau_break_risk": 0, "history_windows": "",
             "consensus": 0.0, "winner_algos": [],
+            "tai_votes": 0, "xiu_votes": 0,
             "note": note,
         }
 
@@ -1021,9 +1240,6 @@ def get_engine(gm: str) -> AdvancedPredictor:
     return _engines[gm]
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# API FETCHERS
-# ═══════════════════════════════════════════════════════════════════════
 async def _fetch_sicbo(session: aiohttp.ClientSession) -> Optional[list]:
     for attempt in range(MAX_RETRIES):
         hdrs = {**SICBO_HEADERS, "User-Agent": _UA_POOL[attempt % len(_UA_POOL)]}
@@ -1093,9 +1309,6 @@ async def _fetch_lc(session: aiohttp.ClientSession, gm: str) -> Optional[list]:
     return None
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# PARSERS
-# ═══════════════════════════════════════════════════════════════════════
 def _parse_sicbo(raw: dict) -> dict:
     faces = raw.get("facesList") or []
     score = raw.get("score") or sum(faces)
@@ -1155,13 +1368,11 @@ async def _load_initial(session: aiohttp.ClientSession, gm: str):
     log.info("✅ %s — loaded %d sessions", GAME_LABELS[gm], len(games))
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# MESSAGE BUILDER
-# ═══════════════════════════════════════════════════════════════════════
 _TYPE_EMO = {
     "TÀI": "🔴", "XỈU": "🔵", "BÃO": "🌪️",
     "NỔ HŨ TÀI": "🏺🔴", "NỔ HŨ XỈU": "🏺🔵", "CHỜ": "🟡",
 }
+
 
 def _te(t: str) -> str:
     return _TYPE_EMO.get(t, "🎲")
@@ -1170,7 +1381,7 @@ def _te(t: str) -> str:
 def _conf_bar(c: int) -> str:
     filled = round(c / 10)
     bar    = "█" * filled + "░" * (10 - filled)
-    badge  = " 🔥🔥" if c >= 90 else (" ⭐⭐" if c >= 82 else (" ⭐" if c >= 74 else ""))
+    badge  = " 🔥🔥" if c >= 92 else (" 🔥" if c >= 85 else (" ⭐⭐" if c >= 78 else (" ⭐" if c >= 70 else "")))
     return f"{bar} <b>{c}%</b>{badge}"
 
 
@@ -1240,13 +1451,15 @@ def _build_msg(gm: str, pred: dict, prev_pred: dict, curr_game: dict) -> str:
     else:
         conf   = pred.get("confidence", 50)
         algos  = pred.get("algo_count", 0)
+        tv     = pred.get("tai_votes", 0)
+        xv     = pred.get("xiu_votes", 0)
         filled = min(int(cau_risk / 20), 5)
         risk_bar = "🔴" * filled + "⚪" * (5 - filled) if cau_risk else "⚪⚪⚪⚪⚪"
 
         base_lines = (
             f"🎯 Dự đoán     : <b>{_te(p_label)} {p_label}</b>\n"
             f"📊 Độ tin cậy  : {_conf_bar(conf)}\n"
-            f"🤝 Đồng thuận  : <b>{consensus:.0%}</b>\n"
+            f"🤝 Đồng thuận  : <b>{consensus:.0%}</b> ({tv}T/{xv}X)\n"
             "━━━━━━━━━━━━━━━━━━━\n"
         )
         if not tx_only:
@@ -1285,9 +1498,6 @@ def _build_msg(gm: str, pred: dict, prev_pred: dict, curr_game: dict) -> str:
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# DB RECORD
-# ═══════════════════════════════════════════════════════════════════════
 def _record_pred(gm: str, pred: dict, actual: dict):
     if not pred or not actual.get("game_num"):
         return
@@ -1322,11 +1532,7 @@ def _record_pred(gm: str, pred: dict, actual: dict):
         log.debug("record_pred: %s", e)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# HOT STREAK BROADCAST
-# ═══════════════════════════════════════════════════════════════════════
 async def _broadcast_hot_streak(app: Application, gm: str, streak: int):
-    """Phát thông báo khi sàn đang thông (thắng nhiều liên tiếp)."""
     label = GAME_LABELS[gm]
     text  = (
         f"🔥🔥🔥 <b>SÀN {label} ĐANG THÔNG {streak} PHIÊN LIÊN TIẾP!</b> 🔥🔥🔥\n"
@@ -1336,11 +1542,7 @@ async def _broadcast_hot_streak(app: Application, gm: str, streak: int):
         f"🚀 Vào game ngay để không bỏ lỡ!\n"
         f"<i>🕐 {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}</i>"
     )
-    # Broadcast cho tất cả user đang dùng auto của sàn này
-    sent = 0
-    auto_chats = list(_states[gm]["auto_msg"].keys())
-    # Cũng gửi cho tất cả allowed_users
-    all_uids = set(auto_chats)
+    all_uids = set(_states[gm]["auto_msg"].keys())
     try:
         with _db() as db:
             rows = db.execute("SELECT user_id FROM allowed_users").fetchall()
@@ -1352,20 +1554,12 @@ async def _broadcast_hot_streak(app: Application, gm: str, streak: int):
     for uid in all_uids:
         try:
             await app.bot.send_message(chat_id=uid, text=text, parse_mode=ParseMode.HTML)
-            sent += 1
             await asyncio.sleep(0.06)
-        except Forbidden:
+        except (Forbidden, TelegramError, Exception):
             pass
-        except TelegramError:
-            pass
-        except Exception:
-            pass
-    log.info("Hot streak broadcast: %s streak=%d sent=%d", gm, streak, sent)
+    log.info("Hot streak broadcast: %s streak=%d", gm, streak)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# PUSH UPDATES
-# ═══════════════════════════════════════════════════════════════════════
 async def _push(app: Application, gm: str, prev_pred: dict, curr_game: dict):
     state    = _states[gm]
     pred     = state["pred"]
@@ -1393,9 +1587,6 @@ async def _push(app: Application, gm: str, prev_pred: dict, curr_game: dict):
         auto_msg.pop(c, None)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# GAME LOOPS
-# ═══════════════════════════════════════════════════════════════════════
 async def _game_loop(app: Application, gm: str):
     state    = _states[gm]
     interval = SICBO_INTERVAL if gm == SICBO else LC_INTERVAL
@@ -1421,13 +1612,11 @@ async def _game_loop(app: Application, gm: str):
 
                 prev_pred = state["pred"].copy()
 
-                new_game = (_parse_sicbo(latest_raw) if gm == SICBO
-                            else _parse_lc(latest_raw, gm))
+                new_game = (_parse_sicbo(latest_raw) if gm == SICBO else _parse_lc(latest_raw, gm))
                 state["history"].appendleft(new_game)
                 state["latest"]    = new_game
                 state["prev_pred"] = prev_pred
 
-                # ── Update consecutive win/loss ─────────────────────────
                 if prev_pred.get("pred") in ("TÀI", "XỈU"):
                     pred_tai   = prev_pred["pred"] == "TÀI"
                     actual_tai = is_tai(new_game["score"], new_game["faces"], gm)
@@ -1437,17 +1626,14 @@ async def _game_loop(app: Application, gm: str):
                             state["consec_loss"] = 0
                             state["consec_win"]  = state.get("consec_win", 0) + 1
                             cw = state["consec_win"]
-                            # Adaptive weight update — reward winning algos
                             winner_algos = prev_pred.get("winner_algos", [])
                             if winner_algos:
                                 get_engine(gm).update_weights_bulk(winner_algos, True)
-                            # Broadcast khi đạt ngưỡng thắng
                             if cw in HOT_STREAK_THRESHOLDS:
                                 asyncio.create_task(_broadcast_hot_streak(app, gm, cw))
                         else:
                             state["consec_win"]  = 0
                             state["consec_loss"] = state.get("consec_loss", 0) + 1
-                            # Penalise wrong algos
                             loser_algos = prev_pred.get("winner_algos", [])
                             if loser_algos:
                                 get_engine(gm).update_weights_bulk(loser_algos, False)
@@ -1463,18 +1649,13 @@ async def _game_loop(app: Application, gm: str):
                 await asyncio.sleep(3)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# MAINTENANCE
-# ═══════════════════════════════════════════════════════════════════════
 async def _notify_all(app: Application, text: str):
-    """Gửi thông báo đến tất cả chat đang theo dõi auto."""
     notified = set()
     for gm in ALL_GAMES:
         for chat_id in list(_states[gm]["auto_msg"].keys()):
             if chat_id not in notified:
                 try:
-                    await app.bot.send_message(chat_id=chat_id,
-                                               text=text, parse_mode=ParseMode.HTML)
+                    await app.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
                     notified.add(chat_id)
                 except Exception:
                     pass
@@ -1509,9 +1690,6 @@ async def _end_maintenance(app: Application):
     await _notify_all(app, "✅ <b>BẢO TRÌ HOÀN TẤT!</b> Bot hoạt động trở lại.")
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# HELPERS
-# ═══════════════════════════════════════════════════════════════════════
 def _gen_key(prefix="SUNWIN") -> str:
     b = "".join(random.choices(string.ascii_uppercase + string.digits, k=16))
     return f"{prefix}-{b[:4]}-{b[4:8]}-{b[8:12]}-{b[12:]}"
@@ -1528,10 +1706,6 @@ def _admin_only(fn):
 
 
 async def _check_maint_lock(update: Update, cmd: str) -> bool:
-    """
-    Kiểm tra bảo trì + lock. Return True nếu bị block.
-    PHẢI dùng await với hàm này.
-    """
     if _maintenance["active"]:
         end_str = (_maintenance["end_time"].strftime("%H:%M")
                    if _maintenance["end_time"] else "sắp tới")
@@ -1552,9 +1726,6 @@ async def _check_maint_lock(update: Update, cmd: str) -> bool:
     return False
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# AUTO & STOP COMMANDS
-# ═══════════════════════════════════════════════════════════════════════
 async def _cmd_auto(update: Update, ctx: ContextTypes.DEFAULT_TYPE, gm: str, cmd_name: str):
     uid     = update.effective_user.id
     chat_id = update.effective_chat.id
@@ -1639,7 +1810,6 @@ async def cmd_stop_auto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_html("ℹ️ Không có phiên auto nào đang chạy.")
 
 
-# ── Live commands ────────────────────────────────────────────────────────
 async def _cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE, gm: str, cmd_name: str):
     uid = update.effective_user.id
     if await _check_maint_lock(update, cmd_name):
@@ -1662,9 +1832,6 @@ async def cmd_live_bet_md5(u, c):  await _cmd_live(u, c, BET_MD5, "live_bet_md5"
 async def cmd_live_bet_hu(u, c):   await _cmd_live(u, c, BET_HU,  "live_bet_hu")
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# KEY SYSTEM
-# ═══════════════════════════════════════════════════════════════════════
 async def cmd_trailkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid      = update.effective_user.id
     username = update.effective_user.username or ""
@@ -1772,9 +1939,6 @@ async def cmd_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# LOCK / UNLOCK — Admin, 100% hoạt động
-# ═══════════════════════════════════════════════════════════════════════
 LOCKABLE_CMDS = {
     "autosicbo", "auto_lc_md5", "auto_lc_hu", "auto_bet_md5", "auto_bet_hu",
     "live", "live_md5", "live_hu", "live_bet_md5", "live_bet_hu",
@@ -1797,9 +1961,8 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_html(
             "🔒 <b>KHÓA CHỨC NĂNG</b>\n"
             "━━━━━━━━━━━━━━━━━━━\n"
-            "Dùng: <code>/lock {lệnh} [lý do]</code>\n"
-            "Ví dụ: <code>/lock autosicbo Đang bảo trì</code>\n\n"
-            "<b>Các lệnh có thể khóa:</b>\n"
+            "Dùng: <code>/lock {lệnh} [lý do]</code>\n\n"
+            "<b>Lệnh có thể khóa:</b>\n"
             "<blockquote>"
             + "\n".join(f"• <code>{c}</code>" for c in sorted(LOCKABLE_CMDS)) +
             "</blockquote>\n"
@@ -1809,11 +1972,8 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     cmd    = ctx.args[0].lower().strip("/")
     reason = " ".join(ctx.args[1:]) if len(ctx.args) > 1 else "Bảo trì"
-
-    # Lưu vào RAM + DB ngay
     lock_cmd(cmd, update.effective_user.id, reason)
 
-    # Notify users của game liên quan
     gm = _CMD_TO_GAME.get(cmd)
     if gm:
         for chat_id in list(_states[gm]["auto_msg"].keys()):
@@ -1822,16 +1982,14 @@ async def cmd_lock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     chat_id=chat_id, parse_mode=ParseMode.HTML,
                     text=(f"🔒 <b>CHỨC NĂNG TẠM KHÓA</b>\n"
                           f"<blockquote><code>{cmd}</code> đang bảo trì\n"
-                          f"Lý do: {reason}\n"
-                          f"Liên hệ admin để biết thêm.</blockquote>")
+                          f"Lý do: {reason}</blockquote>")
                 )
             except Exception:
                 pass
 
     await update.message.reply_html(
         f"🔒 <b>Đã khóa lệnh <code>{cmd}</code></b>\n"
-        f"<blockquote>Lý do: {reason}\n"
-        f"Đã lưu vào DB ✅</blockquote>"
+        f"<blockquote>Lý do: {reason}\nĐã lưu vào DB ✅</blockquote>"
     )
 
 
@@ -1852,15 +2010,13 @@ async def cmd_ulock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     unlock_cmd(cmd)
 
-    # Notify users
     gm = _CMD_TO_GAME.get(cmd)
     if gm:
         for chat_id in list(_states[gm]["auto_msg"].keys()):
             try:
                 await ctx.bot.send_message(
                     chat_id=chat_id, parse_mode=ParseMode.HTML,
-                    text=f"🔓 <b>Chức năng <code>{cmd}</code> đã được mở khóa!</b>\n"
-                         "Bot tiếp tục hoạt động bình thường. ✅"
+                    text=f"🔓 <b>Chức năng <code>{cmd}</code> đã được mở khóa!</b>\n✅"
                 )
             except Exception:
                 pass
@@ -1871,9 +2027,6 @@ async def cmd_ulock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# START — GỬI KÈM GIF
-# ═══════════════════════════════════════════════════════════════════════
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
     name = update.effective_user.first_name or "bạn"
@@ -1881,11 +2034,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             else ("✅ Thành viên" if is_allowed(uid) else "🔒 Chưa kích hoạt"))
 
     welcome_text = (
-        "🎲 <b>SICBO &amp; LẨU CUA &amp; BETVIP </b>\n"
+        "🎲 <b>SICBO &amp; LẨU CUA &amp; BETVIP</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"👋 Chào <b>{name}</b>! [{role}]\n\n"
         "<blockquote>"
-        "🤖 Dự đoán Tài/Xỉu tự động \n"
+        "🤖 Dự đoán Tài/Xỉu tự động\n"
         "🎲 SicBo Sunwin | 🦀 LC MD5 | 🏺 LC Hũ\n"
         "🎰 Betvip MD5   | 🎯 Betvip Hũ\n"
         "━━━━━━━━━━━━━━\n"
@@ -1894,7 +2047,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "💡 <i>/trailkey — Nhận key 2 giờ miễn phí!</i>"
     )
 
-    # Thử gửi GIF từ cùng thư mục với bot
     gif_sent = False
     if os.path.isfile(WELCOME_GIF_PATH):
         try:
@@ -1912,9 +2064,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_html(welcome_text)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# INFO / HELP / LISTKQ
-# ═══════════════════════════════════════════════════════════════════════
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
     base = (
@@ -1993,7 +2142,6 @@ async def cmd_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     auto_status = [GAME_LABELS[gm] for gm in ALL_GAMES
                    if update.effective_chat.id in _states[gm]["auto_msg"]]
 
-    # Win streaks
     streak_info = []
     for gm in ALL_GAMES:
         cw = _states[gm].get("consec_win", 0)
@@ -2008,7 +2156,10 @@ async def cmd_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🆔 ID      : <code>{uid}</code>\n"
         f"🏷 Vai trò : <b>{role}</b>\n"
         f"📅 Hết hạn : <b>{exp}</b>\n"
-        f"🔴 Auto    : {', '.join(auto_status) or 'Không'}"
+        f"📊 Độ chính xác: <b>{acc}</b>\n"
+        f"🎯 Vị chính xác: <b>{vi_acc}</b>\n"
+        f"🔴 Auto    : {', '.join(auto_status) or 'Không'}\n"
+        f"{'🔥 Streak: ' + ' | '.join(streak_info) if streak_info else ''}"
         "</blockquote>"
     )
 
@@ -2075,9 +2226,6 @@ async def cmd_listkq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(text)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# ADMIN COMMANDS
-# ═══════════════════════════════════════════════════════════════════════
 @_admin_only
 async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
@@ -2167,8 +2315,7 @@ async def cmd_tkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "<blockquote>"
         f"Key  : <code>{k}</code>\n"
-        f"Hạn  : {exp[:16].replace('T',' ')} ({hours}h)\n"
-        "Dùng : 1 lần"
+        f"Hạn  : {exp[:16].replace('T',' ')} ({hours}h)"
         "</blockquote>"
     )
 
@@ -2273,8 +2420,7 @@ async def cmd_stat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_baotri(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         await update.message.reply_html(
-            "🔧 Dùng: <code>/baotri &lt;phút&gt; &lt;lý do&gt;</code>\n"
-            "Ví dụ: <code>/baotri 30 Nâng cấp server</code>"
+            "🔧 Dùng: <code>/baotri &lt;phút&gt; &lt;lý do&gt;</code>"
         )
         return
     try:
@@ -2313,9 +2459,6 @@ async def cmd_reset_weights(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html("🔄 <b>Đã reset toàn bộ trọng số AI về mặc định.</b>")
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# CLEANUP LOOP
-# ═══════════════════════════════════════════════════════════════════════
 async def _cleanup_loop():
     while True:
         await asyncio.sleep(1800)
@@ -2339,9 +2482,6 @@ async def _cleanup_loop():
             log.debug("cleanup: %s", e)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# STARTUP
-# ═══════════════════════════════════════════════════════════════════════
 async def post_init(app: Application):
     for gm in ALL_GAMES:
         asyncio.create_task(_game_loop(app, gm))
@@ -2354,11 +2494,10 @@ def main():
     for gm in ALL_GAMES:
         get_engine(gm)
 
-    # Kiểm tra GIF
     if os.path.isfile(WELCOME_GIF_PATH):
         log.info("✅ welcome.gif found at: %s", WELCOME_GIF_PATH)
     else:
-        log.warning("⚠️ welcome.gif NOT found at: %s — /start sẽ không gửi GIF", WELCOME_GIF_PATH)
+        log.warning("⚠️ welcome.gif NOT found at: %s", WELCOME_GIF_PATH)
 
     app = (
         Application.builder()
@@ -2368,33 +2507,28 @@ def main():
     )
 
     handlers = [
-        # User
         CommandHandler("start",          cmd_start),
         CommandHandler("help",           cmd_help),
         CommandHandler("info",           cmd_info),
         CommandHandler("trailkey",       cmd_trailkey),
         CommandHandler("key",            cmd_key),
         CommandHandler("listkq",         cmd_listkq),
-        # Auto
         CommandHandler("autosicbo",      cmd_autosicbo),
         CommandHandler("auto_lc_md5",    cmd_auto_lc_md5),
         CommandHandler("auto_lc_hu",     cmd_auto_lc_hu),
         CommandHandler("auto_bet_md5",   cmd_auto_bet_md5),
         CommandHandler("auto_bet_hu",    cmd_auto_bet_hu),
-        # Stop
         CommandHandler("stop_sicbo",     cmd_stop_sicbo),
         CommandHandler("stop_lc_md5",    cmd_stop_lc_md5),
         CommandHandler("stop_lc_hu",     cmd_stop_lc_hu),
         CommandHandler("stop_bet_md5",   cmd_stop_bet_md5),
         CommandHandler("stop_bet_hu",    cmd_stop_bet_hu),
         CommandHandler("stop_auto",      cmd_stop_auto),
-        # Live
         CommandHandler("live",           cmd_live),
         CommandHandler("live_md5",       cmd_live_md5),
         CommandHandler("live_hu",        cmd_live_hu),
         CommandHandler("live_bet_md5",   cmd_live_bet_md5),
         CommandHandler("live_bet_hu",    cmd_live_bet_hu),
-        # Admin
         CommandHandler("add",            cmd_add),
         CommandHandler("bo",             cmd_bo),
         CommandHandler("luser",          cmd_luser),
@@ -2412,7 +2546,7 @@ def main():
     for h in handlers:
         app.add_handler(h)
 
-    log.info("🎲 SicBo + LC + Betvip Bot Ultra v8.0 starting...")
+    log.info("🎲 SicBo + LC + Betvip Bot Ultra v9.0 starting...")
     app.run_polling(drop_pending_updates=True, poll_interval=1)
 
 
