@@ -34,9 +34,9 @@ SICBO_API = (
     "https://api.wsktnus8.net/v2/history/getLastResult"
     "?gameId=ktrng_3979&size=100&tableId=39791215743193&curPage=1"
 )
-LC_MD5_API     = "https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=07d01d98fd85e91efaa91fe492970412"
-LC_HU_API      = "https://wtx.tele68.com/v1/tx/lite-sessions?cp=R&cl=R&pf=web&at=07d01d98fd85e91efaa91fe492970412"
-BETVIP_MD5_API = "https://wtxmd52.macminim6.online/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=4256ce1eed33ffa0e0990d398f1f907f"
+LC_MD5_API     = "https://wtxmd52.tele68.com/v1/txmd5/sessions?cp=R&cl=R&pf=web&at=07d01d98fd85e91efaa91fe492970412"
+LC_HU_API      = "https://wtx.tele68.com/v1/tx/sessions?cp=R&cl=R&pf=web&at=07d01d98fd85e91efaa91fe492970412"
+BETVIP_MD5_API = "https://wtxmd52.macminim6.online/v1/txmd5/sessions?cp=R&cl=R&pf=web&at=4256ce1eed33ffa0e0990d398f1f907f"
 BETVIP_HU_API  = "https://wtx.macminim6.online/v1/tx/sessions?cp=R&cl=R&pf=web&at=4256ce1eed33ffa0e0990d398f1f907f"
 
 SICBO_HEADERS = {
